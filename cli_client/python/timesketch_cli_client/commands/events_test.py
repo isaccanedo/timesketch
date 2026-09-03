@@ -1,0 +1,105 @@
+# Copyright 2023 Google Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for events command."""
+
+import unittest
+from unittest import mock
+
+from click.testing import CliRunner
+
+from timesketch_api_client import test_lib as api_test_lib
+
+
+from timesketch_cli_client import test_lib
+from timesketch_cli_client.commands.events import events_group
+
+
+class EventsTest(unittest.TestCase):
+    """Test Events."""
+
+    @mock.patch("requests.Session", api_test_lib.mock_session)
+    def setUp(self):
+        """Setup test case."""
+        self.ctx = test_lib.get_cli_context()
+
+    def test_add_event_wrong_param(self):
+        """Test to add a tag to an event with wrong parameters."""
+        runner = CliRunner()
+        result = runner.invoke(
+            events_group,
+            ["annotate", "--event_id", "1", "--tag", "test", "1"],
+            obj=self.ctx,
+        )
+        assert "No such option" in result.output
+        assert "--event_id" in result.output
+        assert "Did you mean" in result.output
+        assert "--event-id" in result.output
+
+    def test_add_event_tag_missing_timeline_id(self):
+        """Test to add a tag to an event."""
+        runner = CliRunner()
+        result = runner.invoke(
+            events_group,
+            ["annotate", "--event-id", "1", "--tag", "test", "1"],
+            obj=self.ctx,
+        )
+        assert result.exit_code == 2
+        assert "Missing option '--timeline-id'" in result.output
+
+    def test_add_event_comment_vs_comments(self):
+        """Test to add a comment to an event but using comment instead of comments"""
+        runner = CliRunner()
+        result = runner.invoke(
+            events_group,
+            [
+                "annotate",
+                "--event-id",
+                "1",
+                "--comments",
+                "test foobar",
+                "--timeline-id",
+                "1",
+            ],
+            obj=self.ctx,
+        )
+
+        assert "No such option" in result.output
+        assert "--comments" in result.output
+        assert "Did you mean" in result.output
+        assert "--comment" in result.output
+
+    def test_failed_add_event(self):
+        """Test to add an event to a sketch with an error."""
+        runner = CliRunner()
+        result = runner.invoke(events_group, ["add"], obj=self.ctx)
+        assert result.exit_code == 2
+        assert "Missing option '--message'" in result.output
+
+    def test_add_event(self):
+        """Test to add an event to a sketch."""
+        runner = CliRunner()
+        result = runner.invoke(
+            events_group,
+            [
+                "add",
+                "--message",
+                "test message",
+                "--date",
+                "2023-03-04T11:31:12",
+                "--timestamp-desc",
+                "test",
+            ],
+            obj=self.ctx,
+        )
+        assert "Event added to sketch: test" in result.output

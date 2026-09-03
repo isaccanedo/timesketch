@@ -1,0 +1,36 @@
+# Copyright 2020 Google Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""End to end test module."""
+
+# Register all tests by importing them.
+# TODO: Re-enable this test. Temporarily disabled while debugging issues.
+# https://github.com/google/timesketch/issues/3546
+# from . import agg_test
+# from . import graph_test
+from . import upload_test
+from . import cli_client_e2e_test
+from . import client_test
+from . import data_finder_test
+from . import event_test
+from . import exportstream_test
+from . import import_plaso_test
+from . import import_plaso_filter_test
+from . import query_test
+from . import timeline_deletion_test
+from . import tsctl_test
+
+from . import export_sketch_test
+from . import wildcard_query_test
+from . import status_race_test
+from . import telemetry_test

@@ -1,0 +1,103 @@
+site_name: "timesketch"
+use_directory_urls: true
+extra_css:
+  - assets/css/extra.css
+markdown_extensions:
+  - meta
+  - attr_list
+  - pymdownx.emoji:
+      emoji_index: !!python/name:materialx.emoji.twemoji
+      emoji_generator: !!python/name:materialx.emoji.to_svg
+
+nav:
+  - Home: index.md
+  - Quickstart: guides/getting-started.md
+
+  - User Guide:
+      - Uploading timelines: guides/user/upload-data.md
+      - Basic concepts: guides/user/basic-concepts.md
+      - Sketch overview: guides/user/sketch-overview.md
+      - Search query guide: guides/user/search-query-guide.md
+      - Command line client: guides/user/cli-client.md
+      - Interactive notebook: guides/user/notebook.md
+      - Import from JSON or CSV: guides/user/import-from-json-csv.md
+      - Use Sigma: guides/user/sigma.md
+      - Intelligence: guides/user/intelligence.md
+      - Analyzers:
+          - Tagger analyzer: guides/analyzers/tagger.md
+          - Feature extraction analyzer: guides/analyzers/feature_extraction.md
+          - Sigma analyzer: guides/analyzers/sigma_analyzer.md
+          - HashR analyzer: guides/analyzers/hashR_lookup.md
+          - LLM Features: guides/user/llm-features-user.md
+  - Admin Guide:
+      - Install: guides/admin/install.md
+      - Upgrade: guides/admin/upgrade.md
+      - Scaling and limits: guides/admin/scaling-and-limits.md
+      - Index Mappings: guides/admin/index-mappings.md
+      - Troubleshooting: guides/admin/troubleshooting.md
+      - Admin CLI: guides/admin/admin-cli.md
+      - Context Links: guides/admin/context-links.md
+      - LLM Features: guides/admin/llm-features.md
+      - Investigation View: guides/admin/investigation-view-setup.md
+      - DFIQ Templates: guides/admin/load-dfiq.md
+      - Performance Monitoring: guides/admin/performance_monitoring.md
+      - OpenTelemetry: guides/admin/OpenTelemetry.md
+  - Developers:
+      - Getting started: developers/getting-started.md
+      - Frontend development: developers/frontend-development.md
+      - Writing and running tests: developers/testing.md
+      - Development with Tilt: developers/tilt-development.md
+      - Local GitHub Actions (act): developers/local_github_actions_with_act.md
+      - Interactive notebook: developers/notebook.md
+      - API client:
+          - Introduction: developers/api-client.md
+          - Upload data via API: developers/api-upload-data.md
+      - CLI client: developers/cli-client.md
+      - Analyzers:
+          - Create an analyzer: developers/analyzer-development.md
+      - AI Log Analyzer Deep Dive: developers/log-analyzer-agent.md
+  - Changelog:
+    - changelog/index.md
+    - changelog/202305-202403.md
+    - changelog/2023-05.md
+    - changelog/2023-03.md
+    - changelog/2023-02.md
+    - changelog/2023-01.md
+    - changelog/2022-12.md
+    - changelog/2022-10.md
+    - changelog/2022-09.md
+  - Community:
+      - Resources: community/resources.md
+      - Roadmap: community/roadmap.md
+      - Events:
+          - Black Hat & defcon 2025: community/2025-blackhat.md
+          - 2021 Summit: community/2021-timesketch-summit.md
+  - Blog: https://osdfir.blogspot.com/search/label/timesketch
+plugins:
+  - redirects:
+      redirect_maps:
+        "learn/basic-concepts.md": "guides/user/basic-concepts.md"
+        "learn/sketch-overview.md": "guides/user/sketch-overview.md"
+        "learn/search-query-guide.md": "guides/user/search-query-guide.md"
+        "learn/notebook.md": "guides/user/notebook.md"
+        "learn/create-timeline-from-json-csv.md": "guides/user/import-from-json-csv.md"
+        "learn/sigma.md": "guides/user/sigma.md"
+        "getting-started/install.md": "guides/admin/install.md"
+        "getting-started/sizing.md": "guides/admin/scaling-and-limits.md"
+        "getting-started/upload-data.md": "guides/user/upload-data.md"
+
+theme:
+  name: material
+  logo: assets/images/timesketch-color.svg
+  language: en
+  features:
+    - navigation.tabs
+    - header.autohide
+  palette:
+    scheme: slate
+    primary: blue
+    accent: blue
+  icon:
+    repo: fontawesome/brands/github
+
+repo_url: https://github.com/google/timesketch

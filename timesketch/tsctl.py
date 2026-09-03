@@ -1,0 +1,4537 @@
+# Copyright 2020 Google Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""CLI management tool."""
+
+import inspect
+import os
+import sys
+import pathlib
+import json
+import re
+import logging
+import time
+import zipfile
+import subprocess
+import datetime
+import traceback
+import tempfile
+import shutil
+import hashlib
+import secrets
+import string
+from typing import Optional, Union, List, Tuple, Dict
+import yaml
+import redis
+
+from opensearchpy import helpers
+
+import sqlalchemy
+import click
+
+import pandas as pd
+from flask_restful import marshal
+from flask import current_app
+from flask.cli import FlaskGroup
+from sqlalchemy import distinct
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
+from werkzeug.exceptions import HTTPException
+from jsonschema import validate, ValidationError, SchemaError
+from celery.result import AsyncResult
+
+
+from timesketch.api.v1 import export as api_export
+from timesketch.api.v1.resources import ResourceMixin
+from timesketch.api.v1 import utils as api_utils
+from timesketch.lib.datastores.opensearch import OpenSearchDataStore
+from timesketch.lib.stories import markdown as markdown_story_exporter
+from timesketch.lib.stories import api_fetcher as story_api_fetcher
+
+from timesketch.lib.definitions import DEFAULT_SOURCE_FIELDS
+
+from timesketch import version
+from timesketch.app import create_app
+from timesketch.app import create_celery_app
+from timesketch.lib import sigma_util
+from timesketch.models import db_session, drop_all, init_db, BaseModel
+from timesketch.models.sketch import Sketch
+from timesketch.models.sketch import Analysis
+from timesketch.models.sketch import SearchTemplate
+from timesketch.models.sigma import SigmaRule
+from timesketch.models.sketch import (
+    Timeline,
+    View,
+    Event,
+    Story,
+    Aggregation,
+    Attribute,
+    Graph,
+    GraphCache,
+    AggregationGroup,
+    AnalysisSession,
+    SearchHistory,
+    Scenario,
+    Facet,
+    InvestigativeQuestion,
+    DataSource,
+    AttributeValue,
+    FacetTimeFrame,
+    FacetConclusion,
+    InvestigativeQuestionApproach,
+    InvestigativeQuestionConclusion,
+    SearchIndex,
+)  # For mixin checks
+from timesketch.models.user import Group, User
+
+# Default filenames for sketch export
+DEFAULT_EXPORT_METADATA_FILENAME = "metadata.json"
+DEFAULT_EXPORT_EVENTS_FILENAME_TEMPLATE = "events.{output_format}"
+DEFAULT_EXPORT_ARCHIVE_FILENAME_TEMPLATE = (
+    "sketch_{sketch_id}_{output_format}_export.zip"
+)
+
+
+def get_sha256(file_path: str) -> str:
+    """Calculate SHA256 of a file.
+
+    Args:
+        file_path (str): Path to the file.
+
+    Returns:
+        str: SHA256 hash of the file.
+    """
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(chunk)
+    return sha256_hash.hexdigest()
+
+
+def _get_open_indices(datastore: OpenSearchDataStore, indices: List[str]) -> List[str]:
+    """Filter a list of indices and return only those that are open.
+
+    Args:
+        datastore: OpenSearchDataStore instance.
+        indices: List of index names to check.
+
+    Returns:
+        List of index names that are confirmed to be open.
+    """
+    open_indices = []
+    if not indices:
+        return open_indices
+
+    # Use a chunked approach to avoid long URLs if there are many indices
+    chunk_size = 100
+    for i in range(0, len(indices), chunk_size):
+        chunk = indices[i : i + chunk_size]
+        try:
+            # cluster.state returns the state of the indices (open/close)
+            # in the 'metadata' section.
+            res = datastore.client.cluster.state(metric="metadata", index=chunk)
+            metadata = res.get("metadata", {}).get("indices", {})
+            for index_name in chunk:
+                state = metadata.get(index_name, {}).get("state")
+                if state == "open":
+                    open_indices.append(index_name)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                "Chunked index state check failed, falling back to one-by-one: %s",
+                str(e),
+            )
+            # If a chunk fails, we fall back to checking one by one
+            for index_name in chunk:
+                try:
+                    res = datastore.client.cluster.state(
+                        metric="metadata", index=index_name
+                    )
+                    state = (
+                        res.get("metadata", {})
+                        .get("indices", {})
+                        .get(index_name, {})
+                        .get("state")
+                    )
+                    if state == "open":
+                        open_indices.append(index_name)
+                except Exception as e_inner:  # pylint: disable=broad-except
+                    logger.debug(
+                        "One-by-one index check failed for %s: %s",
+                        index_name,
+                        str(e_inner),
+                    )
+                    continue
+    return open_indices
+
+
+def _get_random_event_ids(
+    datastore: OpenSearchDataStore,
+    indices: List[str],
+    query_dsl: Dict,
+    count: int = 5,
+) -> List[str]:
+    """Retrieve random event IDs from OpenSearch based on a query.
+
+    Args:
+        datastore: OpenSearchDataStore instance.
+        indices: List of index names to search.
+        query_dsl: The OpenSearch query DSL to filter the selection.
+        count: The number of random event IDs to retrieve.
+
+    Returns:
+        A list of event IDs found in OpenSearch.
+    """
+    random_query = {
+        "query": {
+            "function_score": {
+                "query": query_dsl.get("query", {"match_all": {}}),
+                "random_score": {},
+                "boost_mode": "replace",
+            }
+        },
+        "size": count,
+        "_source": False,
+    }
+    try:
+        res = datastore.client.search(index=indices, body=random_query)
+        return [hit["_id"] for hit in res["hits"]["hits"]]
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error("Error retrieving random event IDs: %s", str(e))
+        return []
+
+
+def _spot_check_file(file_path: str, event_ids: List[str]) -> Dict[str, bool]:
+    """Verify that a list of event IDs exist in a file.
+
+    This is a lightweight verification step that reads the file line-by-line
+    to confirm that the requested event IDs were actually written to the
+    exported file. It stops as soon as all IDs are found.
+
+    Args:
+        file_path: Path to the file to check.
+        event_ids: List of OpenSearch event IDs to search for.
+
+    Returns:
+        A dictionary mapping each event ID to a boolean indicating if it was found.
+    """
+    if not event_ids:
+        return {}
+
+    results = {eid: False for eid in event_ids}
+    remaining = set(event_ids)
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                # We check for the ID as a substring. In JSONL and CSV,
+                # the ID will be present.
+                to_remove = set()
+                for eid in remaining:
+                    if eid in line:
+                        results[eid] = True
+                        to_remove.add(eid)
+                remaining -= to_remove
+                if not remaining:
+                    break
+    except (FileNotFoundError, PermissionError) as e:
+        click.echo(
+            f"  Warning: Could not open {file_path} for verification: {e!s}", err=True
+        )
+    except UnicodeDecodeError as e:
+        click.echo(
+            f"  Warning: Decoding error while reading {file_path}: {e!s}", err=True
+        )
+    except Exception as e:  # pylint: disable=broad-except
+        click.echo(
+            f"  Warning: Unexpected error during verification of {file_path}: {e!s}",
+            err=True,
+        )
+
+    return results
+
+
+opensearch_logger = logging.getLogger("opensearch")
+logger = logging.getLogger("timesketch.tsctl")
+
+
+def configure_opensearch_logger():
+    """Configure the opensearch-py logger for tsctl."""
+    # Set level to INFO to see more request/response logs
+    opensearch_logger.setLevel(logging.WARNING)
+    # Remove any default handlers to prevent duplicate or unwanted formatting
+    opensearch_logger.handlers = []
+    # Add a new handler with a desired formatter
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("[%(asctime)s] %(name)s/%(levelname)s %(message)s")
+    handler.setFormatter(formatter)
+    opensearch_logger.addHandler(handler)
+
+
+# Configure the opensearch logger immediately after imports
+configure_opensearch_logger()
+
+
+@click.group(cls=FlaskGroup, create_app=create_app)
+def cli():
+    """Management script for the Timesketch application."""
+
+
+@cli.command(name="list-users")
+@click.option("--status", "-s", is_flag=True, help="Show status of the users.")
+def list_users(status):
+    """List all users."""
+    for user in User.query.all():
+        if user.admin:
+            extra = " (admin)"
+        else:
+            extra = ""
+        if status:
+            print(f"{user.username}{extra} (active: {user.active})")
+        else:
+            print(f"{user.username}{extra}")
+
+
+@cli.command(name="create-user")
+@click.argument("username")
+@click.option("--password")
+def create_user(username, password=None):
+    """Create a user."""
+
+    def get_password_from_prompt():
+        """Get password from the command line prompt."""
+        first_password = click.prompt("Enter password", hide_input=True, type=str)
+        second_password = click.prompt(
+            "Enter password again", hide_input=True, type=str
+        )
+        if first_password != second_password:
+            print("Passwords don't match, try again.")
+            get_password_from_prompt()
+        return first_password
+
+    if not password:
+        password = get_password_from_prompt()
+    user = User.get_or_create(username=username, name=username)
+    user.set_password(plaintext=password)
+    db_session.add(user)
+    db_session.commit()
+    print(f"User account for {username} created/updated")
+
+
+@cli.command(name="enable-user")
+@click.argument("username")
+def enable_user(username):
+    """Enable a user."""
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        print("User does not exist.")
+        return
+
+    user.active = True
+    db_session.add(user)
+    db_session.commit()
+    print(f"Activated user {username}")
+
+
+@cli.command(name="disable-user")
+@click.argument("username")
+def disable_user(username):
+    """Disable a user."""
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        print("User does not exist.")
+        return
+
+    user.active = False
+    db_session.add(user)
+    db_session.commit()
+    print(f"Disabled user {username}")
+
+
+@cli.command(name="make-admin")
+@click.argument("username")
+def make_admin(username):
+    """Give a user the admin role."""
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        print("User does not exist.")
+        return
+
+    user.admin = True
+    db_session.add(user)
+    db_session.commit()
+    print("User is now an admin.")
+
+
+@cli.command(name="revoke-admin")
+@click.argument("username")
+def revoke_admin(username):
+    """Revoke a user the admin role."""
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        print("User does not exist.")
+        return
+
+    user.admin = False
+    db_session.add(user)
+    db_session.commit()
+    print("User is not an admin anymore.")
+
+
+@cli.command(name="grant-user")
+@click.argument("username")
+@click.option("--sketch_id", type=int, required=True)
+@click.option("--read-only", is_flag=True, help="Grant only read access to the sketch.")
+def grant_user(username, sketch_id, read_only):
+    """Grant a user access to a specific sketch.
+
+    This command allows an administrator to grant permissions to a user
+    for a given sketch. By default, both 'read' and 'write' permissions
+    are granted. If the '--read-only' flag is provided, only 'read'
+    permission will be granted.
+
+    Args:
+        username (str): The username of the user to grant access to.
+        sketch_id (int): The ID of the sketch to grant access to.
+        read_only (bool): If True, grants only 'read' permission.
+                          Otherwise, grants 'read' and 'write' permissions.
+
+    Prints a confirmation message upon success or an error message
+    if the user or sketch does not exist.
+    """
+    sketch = Sketch.get_by_id(sketch_id)
+    user = User.query.filter_by(username=username).first()
+    if not sketch:
+        print("Sketch does not exist.")
+        return
+    if not user:
+        print(f"User {username} does not exist.")
+        return
+
+    sketch.grant_permission(permission="read", user=user)
+    if not read_only:
+        sketch.grant_permission(permission="write", user=user)
+    print(f"User {username} added to the sketch {sketch.id} ({sketch.name})")
+
+
+@cli.command(name="grant-group")
+@click.argument("group_name")
+@click.option("--sketch_id", type=int, required=True)
+@click.option("--read-only", is_flag=True, help="Grant only read access to the sketch.")
+def grant_group(group_name, sketch_id, read_only):
+    """Grant a group access to a specific sketch.
+
+    This command allows an administrator to grant permissions to a group
+    for a given sketch. By default, both 'read' and 'write' permissions
+    are granted. If the '--read-only' flag is provided, only 'read'
+    permission will be granted.
+
+    Args:
+        group_name (str): The name of the group to grant access to.
+        sketch_id (int): The ID of the sketch to grant access to.
+        read_only (bool): If True, grants only 'read' permission.
+                          Otherwise, grants 'read' and 'write' permissions.
+
+    Prints a confirmation message upon success or an error message
+    if the group or sketch does not exist.
+    """
+    sketch = Sketch.get_by_id(sketch_id)
+    group = Group.query.filter_by(name=group_name).first()
+    if not sketch:
+        print("Sketch does not exist.")
+        return
+    if not group:
+        print(f"Group {group_name} does not exist.")
+        return
+    sketch.grant_permission(permission="read", group=group)
+    if not read_only:
+        sketch.grant_permission(permission="write", group=group)
+    print(f"Group {group_name} added to the sketch {sketch.id} ({sketch.name})")
+
+
+@cli.command(name="help")
+@click.pass_context
+def help_command(ctx: click.Context):
+    """Show this message and exit."""
+    print(ctx.parent.get_help())
+
+
+@cli.command(name="version")
+def get_version():
+    """Return the version information of Timesketch."""
+    timesketch_path = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(timesketch_path, ".."))
+    git_dir = os.path.join(project_root, ".git")
+    version_string = version.__version__
+
+    if os.path.isdir(git_dir):
+        try:
+            # Get the short commit hash
+            p_hash = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                cwd=project_root,
+                check=False,
+            )
+            if p_hash.returncode == 0 and p_hash.stdout:
+                version_string = p_hash.stdout.strip()
+
+                # Check if the repository is dirty (has uncommitted changes)
+                p_dirty = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=project_root,
+                    check=False,
+                )
+                if p_dirty.returncode == 0 and p_dirty.stdout:
+                    version_string += "-dirty"
+        except OSError:
+            # Not a git repo or git is not installed.
+            pass
+
+    print(f"Timesketch version: {version_string}")
+
+    # Dynamically fetch OpenSearch server/cluster version
+    try:
+        datastore = OpenSearchDataStore()
+        client_info = datastore.client.info()
+        opensearch_version = client_info.get("version", {}).get("number", "Unknown")
+        print(f"OpenSearch version: {opensearch_version}")
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"OpenSearch version: Unreachable (Error: {e})")
+
+
+@cli.command(name="drop-db")
+def drop_db():
+    """Permanently remove all database tables.
+
+    This action is irreversible and will result in the loss of all data
+    stored in the Timesketch database, including users, sketches, timelines,
+    and all associated metadata. Use with extreme caution.
+    """
+    if click.confirm("Do you really want to drop all the database tables?"):
+        if click.confirm(
+            "Are you REALLLY sure you want to DROP ALL the database tables?"
+        ):
+            drop_all()
+            print("All tables dropped. Database is now empty.")
+
+
+@cli.command(name="list-sketches")
+@click.option(
+    "--archived",
+    is_flag=True,
+    help="Show only archived sketches. Mutually exclusive with --archived-with-open-indexes.",  # pylint: disable=line-too-long
+)
+@click.option(
+    "--archived-with-open-indexes",
+    is_flag=True,
+    help="Show archived sketches that have at least one searchindex with status "
+    "'new', 'ready', 'processing', 'fail','archived' or 'timeout'. "
+    "Mutually exclusive with --archived. This will query OpenSearch.",
+)
+@click.option(
+    "--include-deleted",
+    is_flag=True,
+    help="Include deleted sketches. Default: deleted sketches are hidden.",
+)
+def list_sketches(
+    archived: bool, archived_with_open_indexes: bool, include_deleted: bool
+):
+    """List sketches.
+
+    By default, this command lists all sketches that have not been deleted.
+
+    - If the --archived flag is provided, it will only list sketches
+      that have an 'archived' status.
+
+    - If the --archived-with-open-indexes flag is provided, it will list
+      archived sketches that have one or more associated SearchIndex database
+      objects with a status of 'new', 'ready', 'processing', 'fail', or 'timeout'.
+
+    - If the --include-deleted flag is provided, sketches marked as 'deleted'
+      will also be included in the list, respecting other filters like --archived.
+    """
+    # Initialize the datastore client if needed for OpenSearch checks.
+    datastore = None
+    if archived_with_open_indexes:
+        datastore = OpenSearchDataStore()
+    all_sketches = Sketch.query.all()
+
+    if archived and archived_with_open_indexes:
+        raise click.UsageError(
+            "The options --archived and --archived-with-open-indexes "
+            "are mutually exclusive. Please use only one."
+        )
+
+    # SearchIndex statuses that indicate it's not properly closed/archived
+    open_index_statuses = ["new", "ready", "processing", "fail", "timeout"]
+
+    if archived_with_open_indexes:
+        open_statuses_str = ", ".join(open_index_statuses)
+        click.echo(
+            "Searching for archived sketches with 'open' SearchIndex DB statuses "
+            f"({open_statuses_str}) OR indices that are actually open in OpenSearch..."
+        )
+
+        found_sketches_info = []
+
+        for sketch in all_sketches:
+            if sketch.get_status.status != "archived":
+                continue
+
+            sketch_inconsistency_details = []
+            indices_to_check_in_os = set()
+
+            for tl in sketch.timelines:
+                if tl.searchindex:
+                    si = tl.searchindex
+                    si_status = si.get_status.status
+                    if si_status in open_index_statuses:
+                        sketch_inconsistency_details.append(
+                            f"  - Timeline: '{tl.name}' (ID: {tl.id}), "
+                            f"SearchIndex DB: '{si.index_name}' (ID: {si.id}), "
+                            f"DB Status: '{si_status}' (Inconsistent)"
+                        )
+                    else:
+                        # If DB status is 'archived', add to list for OS check.
+                        indices_to_check_in_os.add(si.index_name)
+
+            if indices_to_check_in_os:
+                try:
+                    # Check the actual status of these indices in OpenSearch
+                    indices_status = datastore.client.indices.get(
+                        index=list(indices_to_check_in_os)
+                    )
+                    for index_name, status_info in indices_status.items():
+                        is_closed = (
+                            status_info.get("settings", {})
+                            .get("index", {})
+                            .get("verified_before_close")
+                            == "true"
+                        )
+                        if not is_closed:
+                            sketch_inconsistency_details.append(
+                                f"  - SearchIndex DB: '{index_name}' is marked "
+                                "'archived' in DB, but is OPEN in OpenSearch."
+                            )
+                except Exception as e:  # pylint: disable=broad-except
+                    click.echo(f"ERROR checking OpenSearch for indices: {e}", err=True)
+
+            if sketch_inconsistency_details:
+                found_sketches_info.append(
+                    {
+                        "sketch_id": sketch.id,
+                        "sketch_name": sketch.name,
+                        "details": sketch_inconsistency_details,
+                    }
+                )
+
+        if not found_sketches_info:
+            print("No archived sketches with inconsistent index statuses found.")
+        else:
+            print("Archived sketches with inconsistent index statuses found:")
+            for sk_info in found_sketches_info:
+                print(
+                    f"Sketch ID: {sk_info['sketch_id']}, Name: '{sk_info['sketch_name']}' (status: archived)"  # pylint: disable=line-too-long
+                )
+                for detail in sk_info["details"]:
+                    print(detail)
+        return
+
+    # Handle default listing or --archived only
+    sketches_to_display = []
+    for sketch in all_sketches:
+        current_status = sketch.get_status.status
+
+        if current_status == "deleted" and not include_deleted:
+            continue
+
+        if archived:
+            if current_status == "archived":
+                sketches_to_display.append(sketch)
+        else:
+            sketches_to_display.append(sketch)
+
+    output_type = ""
+    if not sketches_to_display:
+        if archived:
+            print("No archived sketches found.")
+        elif include_deleted:
+            print("No sketches found (including deleted).")
+        else:
+            print("No sketches found (excluding deleted).")
+        return
+
+    if archived:
+        output_type = "Archived sketches"
+    elif include_deleted:
+        output_type = "Sketches (including deleted, ready, and archived)"
+    else:  # Default
+        output_type = "Sketches (excluding deleted; i.e., ready and archived)"
+
+    print(f"{output_type}:")
+    for sketch in sketches_to_display:
+        print(f"{sketch.id} '{sketch.name}' (status: {sketch.get_status.status})")
+
+
+@cli.command(name="show-mappings")
+@click.option(
+    "--sketch-id",
+    "-s",
+    type=int,
+    required=True,
+    help="Sketch ID to show mappings for.",
+)
+def show_mappings(sketch_id: int):
+    """Show OpenSearch index mappings for all timelines in a sketch."""
+    sketch = Sketch.get_by_id(sketch_id)
+    if not sketch:
+        print(f"Error: Sketch {sketch_id} does not exist.")
+        return
+
+    if not sketch.timelines:
+        print(f"Sketch {sketch_id} '{sketch.name}' has no active timelines.")
+        return
+
+    print(f"Sketch ID: {sketch.id} | Name: '{sketch.name}'")
+    print("-" * 60)
+
+    # Initialize OpenSearch datastore client
+    try:
+        datastore = OpenSearchDataStore()
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"Error: Unable to initialize datastore client: {e}")
+        return
+
+    # Collect all unique physical index names from timelines list
+    unique_indices = {
+        t.searchindex.index_name for t in sketch.timelines if t.searchindex
+    }
+    if not unique_indices:
+        print(f"Sketch {sketch_id} '{sketch.name}' has no physical search indices.")
+        return
+
+    # Retrieve all mappings in a single batch request
+    try:
+        mappings_data = datastore.client.indices.get_mapping(index=list(unique_indices))
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"Error: Failed to retrieve mapping metadata: {e}")
+        return
+
+    if not isinstance(mappings_data, dict):
+        print("Error: OpenSearch client returned an invalid mappings response format.")
+        return
+
+    for timeline in sketch.timelines:
+        if not timeline.searchindex:
+            continue
+        si = timeline.searchindex
+        print(f"Timeline: '{timeline.name}' (ID: {timeline.id})")
+        print(f"SearchIndex DB: '{si.name}' | Physical Index: '{si.index_name}'")
+
+        # Safely extract specific index properties from pre-cached memory
+        properties = (
+            mappings_data.get(si.index_name, {}).get("mappings", {}).get("properties")
+        )
+        if not isinstance(properties, dict):
+            # Handle properties nested under primary document type key
+            properties = next(
+                iter(mappings_data.get(si.index_name, {}).get("mappings", {}).values()),
+                {},
+            ).get("properties")
+
+        if not isinstance(properties, dict) or not properties:
+            print("  (No mapping properties found inside this index)")
+            print("-" * 60)
+            continue
+
+        print("  Active Field Mappings properties tree:")
+        # Sort properties keys for clean listing
+        for field_name in sorted(properties.keys()):
+            field_def = properties[field_name]
+            if not isinstance(field_def, dict):
+                continue
+            field_type = field_def.get("type", "unknown")
+            subfields = field_def.get("fields", {})
+
+            subfields_str = ""
+            if isinstance(subfields, dict) and subfields:
+                subfields_list = []
+                for key, sub_def in subfields.items():
+                    if isinstance(sub_def, dict):
+                        sub_type = sub_def.get("type", "unknown")
+                        subfields_list.append(f".{key} (type: {sub_type})")
+                subfields_str = f" | Subfields: {', '.join(subfields_list)}"
+
+            print(f"    - {field_name:<20} | Type: {field_type:<8}{subfields_str}")
+
+        print("-" * 60)
+
+
+@cli.command(name="list-groups")
+@click.option("--showmembership", is_flag=True, help="Show members of that group.")
+def list_groups(showmembership):
+    """List all groups."""
+    for group in Group.query.all():
+        if showmembership:
+            users = []
+            for user in group.users:
+                users.append(user.username)
+            print(f"{group.name}:{','.join(users)}")
+        else:
+            print(group.name)
+
+
+@cli.command(name="create-group")
+@click.argument("group_name")
+def create_group(group_name):
+    """Create a group."""
+    group = Group.get_or_create(name=group_name, display_name=group_name)
+    db_session.add(group)
+    db_session.commit()
+    print(f"Group created: {group_name}")
+
+
+@cli.command(name="delete-group")
+@click.argument("group_name")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Force delete even if group is used in sketches.",
+)
+def delete_group(group_name: str, force: bool):
+    """Deletes a group from the database.
+
+    If the group is associated with any sketches, a warning message will be displayed,
+    and the deletion will be aborted unless the '--force' flag is used.
+
+    Args:
+        group_name (str): The name of the group to delete.
+        force (bool): If True, force deletes the group even if it's used in sketches.
+    """
+    group = Group.query.filter_by(name=group_name).first()
+    if not group:
+        print("No such group.")
+        return
+
+    # Check if group is used in any sketches
+    sketches = (
+        Sketch.query.join(Sketch.AccessControlEntry)
+        .filter(Sketch.AccessControlEntry.group_id == group.id)
+        .all()
+    )
+
+    if sketches:
+        print(f"Group '{group_name}' is used in the following sketches:")
+        for sketch in sketches:
+            print(f"  - {sketch.id}: {sketch.name}")
+
+        if not force:
+            print("\nError: Cannot delete group because it is used in sketches.")
+            print("Use --force to delete the group.")
+            return
+
+    if click.confirm(f"Are you sure you want to delete the group {group_name}?"):
+        db_session.delete(group)
+        db_session.commit()
+        print(f"Group {group_name} deleted.")
+
+
+@cli.command(name="list-group-members")
+@click.argument("group_name")
+def list_group_members(group_name):
+    """List all members of a group."""
+    group = Group.query.filter_by(name=group_name).first()
+    if not group:
+        print("No such group.")
+        return
+
+    for user in group.users:
+        print(user.username)
+
+
+@cli.command(name="add-group-member")
+@click.argument("group_name")
+@click.option("--username", required=True)
+def add_group_member(group_name, username):
+    """Add a user to a group."""
+    group = Group.query.filter_by(name=group_name).first()
+    if not group:
+        print("No such group.")
+        return
+
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        print("User does not exist.")
+        return
+
+    try:
+        user.groups.append(group)
+        db_session.commit()
+        print("Added user to group.")
+    except IntegrityError:
+        print("User is already a member of the group.")
+
+
+@cli.command(name="remove-group-member")
+@click.argument("group_name")
+@click.option("--username", required=True)
+def remove_group_member(group_name, username):
+    """Remove a user from a group."""
+    group = Group.query.filter_by(name=group_name).first()
+    if not group:
+        print("No such group.")
+        return
+
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        print("User does not exist.")
+        return
+
+    try:
+        user.groups.remove(group)
+        db_session.commit()
+        print("Removed user from group.")
+    except ValueError:
+        print("User is not a member of the group.")
+
+
+@cli.command(name="import-search-templates")
+@click.argument("path")
+def import_search_templates(path):
+    """Import search templates from filesystem path."""
+    file_paths = set()
+    supported_file_types = [".yml", ".yaml"]
+    for root, _, files in os.walk(path):
+        for file in files:
+            file_extension = pathlib.Path(file.lower()).suffix
+            if file_extension in supported_file_types:
+                file_paths.add(os.path.join(root, file))
+
+    for file_path in file_paths:
+        search_templates = None
+        with open(file_path, "r", encoding="utf-8") as fh:
+            search_templates = yaml.safe_load(fh.read())
+
+        if isinstance(search_templates, dict):
+            search_templates = [search_templates]
+
+        if search_templates:
+            for search_template_dict in search_templates:
+                print(f"Importing: {search_template_dict.get('short_name')}")
+                display_name = search_template_dict.get("display_name")
+                description = search_template_dict.get("description")
+                uuid = search_template_dict.get("id")
+                query_string = search_template_dict.get("query_string")
+                query_filter = search_template_dict.get("query_filter", {})
+                query_dsl = search_template_dict.get("query_dsl", {})
+                tags = search_template_dict.get("tags", [])
+
+                searchtemplate = SearchTemplate.query.filter_by(
+                    template_uuid=uuid
+                ).first()
+                if not searchtemplate:
+                    searchtemplate = SearchTemplate(
+                        name=display_name, template_uuid=uuid
+                    )
+                    db_session.add(searchtemplate)
+                    db_session.commit()
+
+                searchtemplate.name = display_name
+                searchtemplate.description = description
+                searchtemplate.template_json = json.dumps(search_template_dict)
+                searchtemplate.query_string = query_string
+                searchtemplate.query_filter = json.dumps(query_filter)
+                searchtemplate.query_dsl = json.dumps(query_dsl)
+
+                if tags:
+                    for tag in tags:
+                        searchtemplate.add_label(tag)
+
+                searchtemplate.grant_permission(permission="read")
+
+                db_session.add(searchtemplate)
+                db_session.commit()
+
+
+@cli.command(name="import-sigma-rules")
+@click.argument("path")
+def import_sigma_rules(path):
+    """Import sigma rules from filesystem path."""
+    file_paths = set()
+    supported_file_types = [".yml", ".yaml"]
+
+    if os.path.isfile(path):
+        file_paths.add(path)
+
+    for root, _, files in os.walk(path):
+        for file in files:
+            file_extension = pathlib.Path(file.lower()).suffix
+            if file_extension in supported_file_types:
+                file_paths.add(os.path.join(root, file))
+
+    for file_path in file_paths:
+        sigma_rule = None
+        sigma_yaml = None
+
+        with open(file_path, "r", encoding="utf-8") as fh:
+            try:
+                sigma_yaml = fh.read()
+                sigma_rule = sigma_util.parse_sigma_rule_by_text(sigma_yaml)
+            except ValueError as e:
+                print(f"Sigma Rule Parsing error: {e}")
+                continue
+            except NotImplementedError as e:
+                print(f"Sigma Rule Parsing error: {e}")
+                continue
+
+        print(f"Importing: {sigma_rule.get('title')}")
+
+        if not sigma_rule:
+            continue
+
+        # Query rules to see if it already exist and exit if found
+        rule_uuid = sigma_rule.get("id")
+        sigma_rule_from_db = SigmaRule.query.filter_by(rule_uuid=rule_uuid).first()
+        if sigma_rule_from_db:
+            print(f"Rule {rule_uuid} is already imported")
+            continue
+
+        sigma_db_rule = SigmaRule.query.filter_by(rule_uuid=rule_uuid).first()
+        if not sigma_db_rule:
+            sigma_db_rule = SigmaRule(
+                rule_uuid=rule_uuid,
+                rule_yaml=sigma_yaml,
+                description=sigma_rule.get("description"),
+                title=sigma_rule.get("title"),
+                user=None,
+            )
+            db_session.add(sigma_db_rule)
+            db_session.commit()
+
+            sigma_db_rule.set_status(sigma_rule.get("status", "experimental"))
+            # query string is not stored in the database but we attach it to
+            # the JSON result here as it is added in the GET methods
+            sigma_db_rule.query_string = sigma_rule.get("search_query")
+        else:
+            print(f"Rule already imported: {sigma_rule.get('title')}")
+
+
+@cli.command(name="list-sigma-rules")
+@click.option(
+    "--columns",
+    default="rule_uuid,title",
+    required=False,
+    help="Comma separated list of columns to show",
+)
+def list_sigma_rules(columns):
+    """List sigma rules"""
+
+    all_sigma_rules = SigmaRule.query.all()
+
+    table_data = [
+        [columns],
+    ]
+
+    for rule in all_sigma_rules:
+        relevant_data = []
+        for column in columns.split(","):
+            if column == "status":
+                relevant_data.append(rule.get_status.status)
+            else:
+                try:
+                    relevant_data.append(getattr(rule, column))
+                except AttributeError:
+                    print(f"Column {column} not found in SigmaRule")
+                    return
+        table_data.append([relevant_data])
+
+    print_table(table_data)
+
+
+@cli.command(name="remove-sigma-rule")
+@click.argument("rule_uuid")
+def remove_sigma_rule(rule_uuid):
+    """Deletes a Sigma rule from the database.
+
+    Deletes a single Sigma rule selected by the `uuid`
+    Args:
+        rule_uuid: UUID of the rule to be deleted.
+    """
+
+    rule = SigmaRule.query.filter_by(rule_uuid=rule_uuid).first()
+
+    if not rule:
+        error_msg = f"No rule found with rule_uuid.{rule_uuid!s}"
+        print(error_msg)  # only needed in debug cases
+        return
+
+    print(f"Rule {rule_uuid} deleted")
+    db_session.delete(rule)
+    db_session.commit()
+
+
+@cli.command(name="remove-all-sigma-rules")
+def remove_all_sigma_rules():
+    """Deletes all Sigma rule from the database."""
+
+    if click.confirm("Do you really want to drop all the Sigma rules?"):
+        if click.confirm("Are you REALLLY sure you want to DROP ALL the Sigma rules?"):
+            all_sigma_rules = SigmaRule.query.all()
+            for rule in all_sigma_rules:
+                db_session.delete(rule)
+                db_session.commit()
+
+            print("All rules deleted")
+
+
+@cli.command(name="export-sigma-rules")
+@click.argument("path")
+def export_sigma_rules(path):
+    """Export sigma rules to a filesystem path."""
+
+    if not os.path.isdir(path):
+        raise RuntimeError(
+            f"The directory needs to exist, please create: {path:s} first"
+        )
+
+    all_sigma_rules = SigmaRule.query.all()
+
+    n = 0
+
+    for rule in all_sigma_rules:
+        file_path = os.path.join(path, f"{rule.title}.yml")
+        if os.path.isfile(file_path):
+            print(f"File [{file_path:s}] already exists.")
+            continue
+
+        with open(file_path, "wb") as fw:
+            fw.write(rule.rule_yaml.encode("utf-8"))
+        n = n + 1
+    print(f"{n} Sigma rules exported")
+
+
+@cli.command(name="info")
+def info():
+    """Display detailed information about the Timesketch environment.
+
+    This command provides a comprehensive overview of the Timesketch installation
+    and its environment, including version information, commit details (if
+    applicable), and the versions of key dependencies.
+
+    The output includes:
+        - Timesketch version and, if available, the Git commit hash (with a
+          "-dirty" suffix if there are uncommitted changes).
+        - Versions of essential tools like psort (from Plaso), Node.js, npm, yarn,
+          Python, and pip.
+    """
+    print(f"Timesketch version: {version.get_version()}")  # Displays Timesketch version
+
+    timesketch_path = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(
+        os.path.join(timesketch_path, "..")
+    )  # Project root directory
+    git_dir = os.path.join(project_root, ".git")  # Path to the .git directory
+    timesketch_commit = "unknown"
+    if os.path.isdir(git_dir):
+        try:
+            # Get the short commit hash
+            p_hash = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                cwd=project_root,
+                check=False,
+            )
+            if (
+                p_hash.returncode == 0 and p_hash.stdout
+            ):  # Check for successful git execution and output
+                commit_hash = p_hash.stdout.strip()
+
+                # Check if the repository is dirty (has uncommitted changes)
+                p_dirty = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=project_root,
+                    check=False,
+                )
+                if p_dirty.returncode == 0 and p_dirty.stdout:
+                    commit_hash += "-dirty"
+                timesketch_commit = commit_hash
+        except OSError:
+            # Not a git repo or git is not installed.
+            pass
+
+    if timesketch_commit != "unknown":
+        if timesketch_commit.endswith("-dirty"):
+            timesketch_commit = timesketch_commit.replace("-dirty", "")
+            print(f"Timesketch commit: {timesketch_commit} (dirty)")
+        else:
+            print(f"Timesketch commit: {timesketch_commit}")
+
+    # Get plaso version
+    try:
+        output = subprocess.check_output(["psort.py", "--version"])
+        print(output.decode("utf-8"))
+    except FileNotFoundError:
+        print("psort.py not installed")
+
+    # Get installed node version
+    try:
+        output = subprocess.check_output(["node", "--version"]).decode("utf-8")
+        print(f"Node version: {output} ")
+    except FileNotFoundError:
+        print("Node not installed. Node is only used in the dev environment.")
+
+    try:
+        # Get installed npm version
+        output = subprocess.check_output(["npm", "--version"]).decode("utf-8")
+        print(f"npm version: {output}")
+    except FileNotFoundError:
+        print("npm not installed. npm is only used in the dev environment.")
+
+    try:
+        # Get installed yarn version
+        output = subprocess.check_output(["yarn", "--version"]).decode("utf-8")
+        print(f"yarn version: {output} ")
+    except FileNotFoundError:
+        print("yarn not installed. Yarn is only used in the dev environment.")
+
+    try:
+        # Get installed python version
+        output = subprocess.check_output(["python3", "--version"]).decode("utf-8")
+        print(f"Python version: {output} ")
+    except FileNotFoundError:
+        print("Python3 not installed")
+
+    try:
+        # Get installed pip version
+        output = subprocess.check_output(["pip", "--version"]).decode("utf-8")
+        print(f"pip version: {output} ")
+    except FileNotFoundError:
+        print("pip not installed")
+
+    # Get OpenSearch version
+    try:
+        es = OpenSearchDataStore()
+        print(f"OpenSearch version: {es.version}")
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"OpenSearch: Not running or not configured ({e})")
+
+    # Get Redis version
+    try:
+        celery = create_celery_app()
+        redis_url = celery.conf.broker_url
+        redis_client = redis.from_url(redis_url)
+        print(f"Redis version: {redis_client.info()['redis_version']}")
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"Redis: Not running or not configured ({e})")
+
+    # Get Postgres version
+    try:
+        db_uri = current_app.config.get("SQLALCHEMY_DATABASE_URI", "")
+        if "postgresql" in db_uri:
+            version_row = db_session.execute(
+                sqlalchemy.text("SELECT version();")
+            ).fetchone()
+            print(f"Postgres version: {version_row[0]}")
+        else:
+            print("Database: Not using PostgreSQL")
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"Database: Error getting version ({e})")
+
+
+def print_table(table_data):
+    """Prints a table."""
+    # calculate the maximum length of each column
+    max_lengths = [0] * len(table_data[0])
+    for row in table_data:
+        for i, cell in enumerate(row):
+            max_lengths[i] = max(max_lengths[i], len(str(cell)))
+
+    # create the table
+    for row in table_data:
+        for i, cell in enumerate(row):
+            print(str(cell).ljust(max_lengths[i]), end=" ")
+        print()
+
+
+@cli.command(name="sketch-info")
+@click.argument("sketch_id", type=int)
+def sketch_info(sketch_id: int):
+    """Display detailed information about a specific sketch.
+
+    This command retrieves and displays comprehensive information about a
+    Timesketch sketch, including:
+
+    - **Sketch Details:** The sketch's ID and name.
+    - **Timelines:** A table listing the timelines within the
+      sketch, including their search index ID, index name, creation date,
+      user ID, description, status, timeline name, and timeline ID.
+    - **Sharing Information:** Details about users and groups with whom the
+      sketch is shared.
+    - **Sketch Status:** The current status of the sketch (e.g., "ready",
+      "archived").
+    - **Public Status:** Whether the sketch is publicly accessible.
+    - **Sketch Labels:** Any labels applied to the sketch.
+    - **Status History:** A table showing the status history of the sketch,
+      including the status ID, status value, creation date, and user ID.
+
+    Args:
+        sketch_id (str): The ID of the sketch to retrieve information about.
+
+    Raises:
+        SystemExit: If the specified sketch does not exist.
+    """
+    sketch = Sketch.get_by_id(sketch_id)
+    if not sketch:
+        print("Sketch does not exist.")
+        return
+
+    print(f"Sketch {sketch_id} Name: ({sketch.name})")
+
+    datastore = OpenSearchDataStore()
+
+    # Timelines table
+    print("\nTimelines:")
+    timeline_table_data = [
+        [
+            "ID",
+            "Name",
+            "Events",
+            "Search Index ID",
+            "Index Name",
+            "Created At",
+            "User ID",
+            "Description",
+            "Status",
+        ],
+    ]
+    unique_indices = set()
+    for t in sketch.timelines:
+        index_name = t.searchindex.index_name
+        unique_indices.add(index_name)
+        try:
+            events_count, _ = datastore.count([index_name])
+        except Exception as e:  # pylint: disable=broad-except
+            print(f"WARNING: Unable to get event count for index {index_name}: {e}")
+            events_count = 0
+
+        timeline_table_data.append(
+            [
+                t.id,
+                t.name,
+                f"{events_count:,}",
+                t.searchindex_id,
+                index_name,
+                t.created_at,
+                t.user_id,
+                t.description,
+                t.status[-1].status,
+            ]
+        )
+    print_table(timeline_table_data)
+
+    # Total events in sketch
+    try:
+        total_events, _ = datastore.count(list(unique_indices))
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"WARNING: Unable to get total event count for sketch: {e}")
+        total_events = 0
+    print(f"\nTotal events in sketch: {total_events:,}")
+
+    # Data sources per timeline
+    print("\nData Sources per Timeline:")
+    for t in sketch.timelines:
+        print(f"\nTimeline: {t.name} (ID: {t.id})")
+        if t.datasources:
+            ds_table_data = [
+                [
+                    "ID",
+                    "File Path",
+                    "Status",
+                    "Error Message",
+                ],
+            ]
+            for ds in t.datasources:
+                error_message = ds.error_message or "N/A"
+                ds_table_data.append(
+                    [
+                        ds.id,
+                        ds.file_on_disk,
+                        (ds.status[-1].status if ds.status else "N/A"),
+                        error_message,
+                    ]
+                )
+            print_table(ds_table_data)
+        else:
+            print("  No data sources found for this timeline.")
+
+    print(f"\nCreated by: {sketch.user.username}")
+    all_permissions = sketch.get_all_permissions()
+
+    print("Shared with:")
+    print("\tUsers: (user_id, username, access_level)")
+    if sketch.collaborators:
+        for user in sketch.collaborators:
+            user_perm_key = f"user/{user.username}"
+            perms = all_permissions.get(user_perm_key, [])
+            access_level = "unknown"
+            if "write" in perms:  # 'write' permission implies 'read'
+                access_level = "read/write"
+            elif "read" in perms:
+                access_level = "read-only"
+            else:
+                access_level = "none"  # Should not happen if user is a collaborator
+            print(f"\t\t{user.id}: {user.username} ({access_level})")
+    else:
+        print("\tNo users shared with.")
+
+    print(f"\tGroups ({len(sketch.groups)}): (group_name, access_level)")
+    if sketch.groups:
+        for group in sketch.groups:
+            group_perm_key = f"group/{group.name}"
+            perms = all_permissions.get(group_perm_key, [])
+            access_level = "unknown"
+            if "write" in perms:  # 'write' permission implies 'read'
+                access_level = "read/write"
+            elif "read" in perms:
+                access_level = "read-only"
+            else:
+                access_level = "none"  # Should not happen if group is listed
+            print(f"\t\t{group.display_name} ({access_level})")
+    else:
+        print("\tNo groups shared with.")
+    sketch_labels = [label.label for label in sketch.labels]
+    print(f"Sketch Status: {sketch.get_status.status}")
+    print(f"Sketch is public: {bool(sketch.is_public)}")
+    sketch_labels = ([label.label for label in sketch.labels],)
+    print(f"Sketch Labels: {sketch_labels}")
+
+    status_table = [
+        [
+            "id",
+            "status",
+            "created_at",
+            "user_id",
+        ],
+    ]
+    for _status in sketch.status:
+        status_table.append(
+            [_status.id, _status.status, _status.created_at, _status.user_id]
+        )
+    print("Status:")
+    print_table(status_table)
+
+
+def _query_db_label_stats(sketch_id: int) -> list:
+    """Query the relational database for label statistics."""
+    print("\n[+] Querying Relational Database for 'timesketch_label'...")
+    label_counts_db = []
+    try:
+        total_labeled_in_db = (
+            db_session.query(distinct(Event.id))
+            .filter(Event.sketch_id == sketch_id, Event.labels.any())
+            .count()
+        )
+        print(f"  - Total events with at least one label: {total_labeled_in_db}")
+
+        label_counts_db = (
+            db_session.query(Event.Label.label, func.count(Event.id))
+            .join(Event.labels)
+            .filter(Event.sketch_id == sketch_id)
+            .group_by(Event.Label.label)
+            .order_by(func.count(Event.id).desc())
+            .all()
+        )
+
+        if label_counts_db:
+            print("  - Counts per label:")
+            for label, count in label_counts_db:
+                print(f"    - {label}: {count}")
+        else:
+            print("  - No individual label records found in the database.")
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"  - ERROR querying database: {e}")
+    return label_counts_db
+
+
+def _query_os_label_stats_agg(
+    sketch: Sketch, datastore: OpenSearchDataStore, indices: list, verbose: bool
+) -> list:
+    """Query OpenSearch for label stats using the aggregation API."""
+    print("\n  -> Method 1: 'timesketch_label' counts using the Aggregation API")
+    label_counts_agg = []
+    try:
+        query_dsl_total = {
+            "query": {
+                "nested": {
+                    "path": "timesketch_label",
+                    "query": {"term": {"timesketch_label.sketch_id": sketch.id}},
+                }
+            }
+        }
+        if verbose:
+            print("    - Fetching all events with at least one label:")
+            result = datastore.search(
+                sketch_id=sketch.id, indices=indices, query_dsl=query_dsl_total
+            )
+            for event in result.get("hits", {}).get("hits", []):
+                print(json.dumps(event, indent=2))
+        else:
+            total_labeled_os = datastore.search(
+                sketch_id=sketch.id,
+                indices=indices,
+                query_dsl=query_dsl_total,
+                count=True,
+            )
+            print(f"    - Total events with at least one label: {total_labeled_os}")
+
+        label_counts_agg = datastore.get_filter_labels(sketch.id, indices)
+        if label_counts_agg:
+            print("    - Counts per label:")
+            sorted_labels = sorted(
+                label_counts_agg, key=lambda x: x["count"], reverse=True
+            )
+            for item in sorted_labels:
+                print(f"      - {item['label']}: {item['count']}")
+        else:
+            print("    - No labels found via aggregation.")
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"    - ERROR during aggregation query: {e}")
+    return label_counts_agg
+
+
+def _query_os_label_stats_search(
+    sketch: Sketch,
+    datastore: OpenSearchDataStore,
+    indices: list,
+    verbose: bool,
+    label_counts_agg: list,
+    label_counts_db: list,
+):
+    """Query OpenSearch for label stats using the search API."""
+    print("\n  -> Method 2: 'timesketch_label' counts using the Search API")
+    try:
+        if label_counts_agg:
+            labels_to_search = [item["label"] for item in label_counts_agg]
+        else:
+            labels_to_search = [label for label, _ in label_counts_db]
+
+        if labels_to_search:
+            if verbose:
+                print("    - Events per label (iterative search):")
+                for label in sorted(labels_to_search):
+                    print(f"      --- Events for label: {label} ---")
+                    query_filter = {"chips": [{"type": "label", "value": label}]}
+                    result = datastore.search(
+                        sketch_id=sketch.id,
+                        indices=indices,
+                        query_filter=query_filter,
+                    )
+                    for event in result.get("hits", {}).get("hits", []):
+                        print(json.dumps(event, indent=2))
+            else:
+                print("    - Counts per label (iterative search):")
+                for label in sorted(labels_to_search):
+                    query_filter = {"chips": [{"type": "label", "value": label}]}
+                    count = datastore.search(
+                        sketch_id=sketch.id,
+                        indices=indices,
+                        query_filter=query_filter,
+                        count=True,
+                    )
+                    print(f"      - {label}: {count}")
+        else:
+            print("    - No labels found to search for.")
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"    - ERROR during search query: {e}")
+
+
+def _query_os_tag_stats(
+    sketch: Sketch, datastore: OpenSearchDataStore, indices: list, verbose: bool
+):
+    """Query OpenSearch for legacy 'tag' field statistics."""
+    print("\n[+] Querying OpenSearch for legacy 'tag' field...")
+
+    print("\n  -> Method 3: 'tag' count using Search API (query_string)")
+    try:
+        if verbose:
+            print("    - Fetching all events with at least one tag:")
+            result = datastore.search(
+                sketch_id=sketch.id, indices=indices, query_string="_exists_:tag"
+            )
+            for event in result.get("hits", {}).get("hits", []):
+                print(json.dumps(event, indent=2))
+        else:
+            total_tagged_events = datastore.search(
+                sketch_id=sketch.id,
+                indices=indices,
+                query_string="_exists_:tag",
+                count=True,
+            )
+            print(f"    - Total events with at least one tag: {total_tagged_events}")
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"    - ERROR during search query: {e}")
+
+    print("\n  -> Method 4: 'tag' counts using Aggregation API")
+    try:
+        agg_params = {"field": "tag.keyword", "limit": 100}
+        result_obj, _ = api_utils.run_aggregator(
+            sketch.id, "field_bucket", agg_params, indices=indices
+        )
+        tag_buckets = result_obj.to_dict().get("values", [])
+
+        if tag_buckets:
+            field_name = agg_params.get("field")
+            if verbose:
+                print("    - Events per tag (from aggregation results):")
+                for bucket in tag_buckets:
+                    tag = bucket[field_name]
+                    print(f"      --- Events for tag: {tag} ---")
+                    result = datastore.search(
+                        sketch_id=sketch.id,
+                        indices=indices,
+                        query_string=f'tag:"{tag}"',
+                    )
+                    for event in result.get("hits", {}).get("hits", []):
+                        print(json.dumps(event, indent=2))
+            else:
+                print("    - Counts per tag:")
+                for bucket in tag_buckets:
+                    print(f"      - {bucket[field_name]}: {bucket['count']}")
+        else:
+            print("    - No tags found via aggregation.")
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"    - ERROR during aggregation query: {e}")
+
+
+def _query_os_complex_example(
+    sketch: Sketch, datastore: OpenSearchDataStore, indices: list, verbose: bool
+):
+    """Run and display a complex query example."""
+    print("\n[+] Complex Query Example (Raw DSL)...")
+    print("  -> Method 5: Count events with '__ts_star' but NOT '__ts_comment'")
+    # pylint: disable=line-too-long
+    try:
+        complex_dsl = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {
+                            "nested": {
+                                "path": "timesketch_label",
+                                "query": {
+                                    "bool": {
+                                        "must": [
+                                            {
+                                                "term": {
+                                                    "timesketch_label.name.keyword": "__ts_star"
+                                                }
+                                            },
+                                            {
+                                                "term": {
+                                                    "timesketch_label.sketch_id": (
+                                                        sketch.id
+                                                    )
+                                                }
+                                            },
+                                        ]
+                                    }
+                                },
+                            }
+                        }
+                    ],
+                    "must_not": [
+                        {
+                            "nested": {
+                                "path": "timesketch_label",
+                                "query": {
+                                    "bool": {
+                                        "must": [
+                                            {
+                                                "term": {
+                                                    "timesketch_label.name.keyword": "__ts_comment"
+                                                }
+                                            },
+                                            {
+                                                "term": {
+                                                    "timesketch_label.sketch_id": (
+                                                        sketch.id
+                                                    )
+                                                }
+                                            },
+                                        ]
+                                    }
+                                },
+                            }
+                        }
+                    ],
+                }
+            }
+        }
+        # pylint: enable=line-too-long
+        if verbose:
+            print("    - Fetching events with '__ts_star' but NOT '__ts_comment':")
+            result = datastore.search(
+                sketch_id=sketch.id, indices=indices, query_dsl=complex_dsl
+            )
+            for event in result.get("hits", {}).get("hits", []):
+                print(json.dumps(event, indent=2))
+        else:
+            complex_count = datastore.search(
+                sketch_id=sketch.id, indices=indices, query_dsl=complex_dsl, count=True
+            )
+            print(f"    - Result: {complex_count} events")
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"    - ERROR during complex DSL query: {e}")
+
+
+@cli.command(name="sketch-label-stats")
+@click.option("--sketch_id", type=int, required=True)
+@click.option(
+    "--verbose",
+    is_flag=True,
+    default=False,
+    help="Show full event data instead of just counts.",
+)
+def sketch_label_stats(sketch_id: int, verbose: bool):
+    """Display label and tag statistics for a specific sketch.
+
+    This command provides statistics on labeled and tagged events for a given
+    sketch. It queries both the relational database and the OpenSearch
+    datastore to provide a comprehensive view.
+
+    The output includes:
+    - Total count of events with at least one label/tag.
+    - A breakdown of event counts for each individual label/tag.
+    - An example of a complex query using raw DSL.
+
+    Args:
+        sketch_id (int): The ID of the sketch to analyze.
+        verbose (bool): If true, show full event data instead of counts.
+    """
+    sketch = Sketch.get_by_id(sketch_id)
+    if not sketch:
+        print(f"Sketch with ID {sketch_id} not found.")
+        return
+
+    print(f"--- Label and Tag Stats for Sketch: '{sketch.name}' (ID: {sketch.id}) ---")
+
+    label_counts_db = _query_db_label_stats(sketch_id)
+
+    print("\n[+] Querying OpenSearch Datastore...")
+    datastore = OpenSearchDataStore()
+    indices = [t.searchindex.index_name for t in sketch.active_timelines]
+
+    if not indices:
+        print("  - No active timelines in this sketch to query in OpenSearch.")
+        return
+
+    label_counts_agg = _query_os_label_stats_agg(sketch, datastore, indices, verbose)
+
+    _query_os_label_stats_search(
+        sketch, datastore, indices, verbose, label_counts_agg, label_counts_db
+    )
+
+    _query_os_tag_stats(sketch, datastore, indices, verbose)
+
+    _query_os_complex_example(sketch, datastore, indices, verbose)
+
+    print("\n--- End of Stats ---")
+
+
+@cli.command(name="event-details")
+@click.option("--sketch-id", "--sketch_id", type=int, required=True)
+@click.option("--event-id", "--event_id", type=str, required=True)
+@click.option(
+    "--searchindex-id",
+    type=str,
+    required=False,
+    help="Optional: The OpenSearch index name for the event.",
+)
+def event_details(sketch_id: int, event_id: str, searchindex_id: Optional[str] = None):
+    """Display all data for a specific event.
+
+    This command retrieves and displays all available information for a single
+    event, combining data from both the OpenSearch datastore and the relational
+    database.
+
+    The output includes:
+    - The full JSON source of the event from OpenSearch.
+    - Comments and labels from the Timesketch database.
+    - Tags stored within the OpenSearch document.
+
+    If the --searchindex-id is not provided, the command will automatically
+    search for the event across all active timelines within the sketch.
+    """
+    sketch = Sketch.get_by_id(sketch_id)
+    if not sketch:
+        print(f"Sketch with ID {sketch_id} not found.")
+        return
+
+    datastore = OpenSearchDataStore()
+
+    os_event_data = None
+    if searchindex_id:
+        try:
+            os_event_data = datastore.get_event(searchindex_id, event_id)
+        except HTTPException as e:
+            print(f"Error getting event from OpenSearch: {e.description}")
+            return
+        except Exception as e:  # pylint: disable=broad-except
+            print(f"An unexpected error occurred while fetching from OpenSearch: {e}")
+            return
+    else:
+        print("No searchindex_id provided, searching across all sketch timelines...")
+        for timeline in sketch.active_timelines:
+            current_index = timeline.searchindex.index_name
+            try:
+                os_event_data = datastore.get_event(current_index, event_id)
+                if os_event_data:
+                    searchindex_id = current_index
+                    print(f"Event found in index: {searchindex_id}")
+                    break
+            except HTTPException:
+                continue  # Event not found in this index, try the next one.
+            except Exception as e:  # pylint: disable=broad-except
+                print(f"An error occurred while searching index {current_index}: {e}")
+
+    if not os_event_data:
+        print(f"Event with ID '{event_id}' not found in any of the sketch's timelines.")
+        return
+
+    print(
+        f"--- Details for Event ID: {event_id} in Sketch: {sketch.name} ({sketch.id}) ---"  # pylint: disable=line-too-long
+    )
+    print(f"--- Index: {searchindex_id} ---")
+
+    print("\n[+] OpenSearch Document:")
+    print(json.dumps(os_event_data.get("_source", {}), indent=2))
+
+    # 2. Get data from Database
+    print("\n[+] Timesketch Database Information:")
+    searchindex = SearchIndex.query.filter_by(index_name=searchindex_id).first()
+    if not searchindex:
+        print(f"  - SearchIndex '{searchindex_id}' not found in the database.")
+        db_event = None
+    else:
+        # Check if searchindex is part of sketch
+        is_in_sketch = any(
+            tl.searchindex and tl.searchindex.index_name == searchindex_id
+            for tl in sketch.timelines
+        )
+        if not is_in_sketch:
+            print(
+                f"  - WARNING: SearchIndex '{searchindex_id}' is not part of sketch '{sketch.name}' ({sketch.id})."  # pylint: disable=line-too-long
+            )
+
+        db_event = Event.query.filter_by(
+            sketch=sketch, searchindex=searchindex, document_id=event_id
+        ).first()
+
+    if not db_event:
+        print(
+            "  - No corresponding event record found in the Timesketch database (no comments or labels)."  # pylint: disable=line-too-long
+        )
+    else:
+        # Get comments
+        if db_event.comments:
+            print("  - Comments:")
+            for comment in db_event.comments:
+                username = comment.user.username if comment.user else "System"
+                print(f"    - [{comment.created_at}] by {username}: {comment.comment}")
+        else:
+            print("  - No comments.")
+
+        # Get labels
+        if db_event.labels:
+            print("  - Labels:")
+            for label in db_event.labels:
+                username = label.user.username if label.user else "System"
+                print(f"    - [{label.created_at}] by {username}: {label.label}")
+        else:
+            print("  - No labels.")
+
+    # 3. Get tags from OpenSearch document
+    print("\n[+] Tags (from OpenSearch document):")
+    tags = os_event_data.get("_source", {}).get("tag", [])
+    if tags:
+        for tag in tags:
+            print(f"  - {tag}")
+    else:
+        print("  - No tags.")
+
+    print("\n--- End of Details ---")
+
+
+@cli.command(name="timeline-status")
+@click.argument("timeline_id", type=int)
+@click.option(
+    "--action",
+    default="get",
+    type=click.Choice(["get", "set"]),
+    required=False,
+    help="get or set timeline status.",
+)
+@click.option(
+    "--status",
+    required=False,
+    type=click.Choice(["ready", "processing", "fail"]),
+    help="get or set timeline status.",
+)
+def timeline_status(timeline_id: int, action: str, status: str):
+    """Get or set a timeline status.
+
+    If "action" is "set", the given value of status will be written in the status.
+
+    Args:
+        timeline_id (int): The ID of the timeline.
+        action (str):  The action to perform ("get" or "set").
+        status (str): The timeline status to set.  Must be one of "ready",
+                      "processing", or "fail".
+    """
+    if action == "get":
+        timeline = Timeline.query.filter_by(id=timeline_id).first()
+        if not timeline:
+            print("Timeline does not exist.")
+            return
+        # define the table data
+        table_data = [
+            [
+                "searchindex_id",
+                "index_name",
+                "created_at",
+                "user_id",
+                "description",
+                "status",
+            ],
+        ]
+        table_data.append(
+            [
+                timeline.searchindex_id,
+                timeline.searchindex.index_name,
+                timeline.created_at,
+                timeline.user_id,
+                timeline.description,
+                timeline.status[-1].status,
+            ]
+        )
+        print_table(table_data)
+
+        status_table = [
+            [
+                "id",
+                "status",
+                "created_at",
+                "user_id",
+            ],
+        ]
+        for _status in timeline.status:
+            status_table.append(
+                [_status.id, _status.status, _status.created_at, _status.user_id]
+            )
+        print("Status:")
+        print_table(status_table)
+
+        print("\nData Sources:")
+        if timeline.datasources:
+            ds_table_data = [
+                [
+                    "ID",
+                    "File Path",
+                    "Status",
+                    "Error Message",
+                ],
+            ]
+            for ds in timeline.datasources:
+                error_message = ds.error_message or "N/A"
+                ds_table_data.append(
+                    [
+                        ds.id,
+                        ds.file_on_disk,
+                        (ds.status[-1].status if ds.status else "N/A"),
+                        error_message,
+                    ]
+                )
+            print_table(ds_table_data)
+        else:
+            print("No data sources found for this timeline.")
+
+    elif action == "set":
+        timeline = Timeline.query.filter_by(id=timeline_id).first()
+        if not timeline:
+            print("Timeline does not exist.")
+            return
+        # exit if status is not set
+        if not status:
+            print("Status is not set.")
+            return
+        timeline.set_status(status)
+        db_session.commit()
+        print(f"Timeline {timeline_id} status set to {status}")
+        # to verify run:
+        print((f"To verify run: tsctl timeline-status {timeline_id} --action get"))
+
+
+@cli.command(name="validate-context-links-conf")
+@click.argument("path")
+def validate_context_links_conf(path):
+    """Validates the provided context link yaml configuration file."""
+
+    hardcoded_modules_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "short_name": {"type": "string"},
+            "match_fields": {
+                "type": "array",
+                "items": [
+                    {"type": "string"},
+                ],
+            },
+            "validation_regex": {"type": "string"},
+        },
+        "required": ["short_name", "match_fields"],
+    }
+
+    linked_services_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "context_link": {
+                "type": "string",
+                "pattern": "<ATTR_VALUE>",
+            },
+            "match_fields": {
+                "type": "array",
+                "minItems": 1,
+                "items": [
+                    {
+                        "type": "string",
+                    },
+                ],
+            },
+            "redirect_warning": {
+                "type": "boolean",
+            },
+            "short_name": {
+                "type": "string",
+                "minLength": 1,
+            },
+            "validation_regex": {
+                "type": "string",
+            },
+        },
+        "required": [
+            "context_link",
+            "match_fields",
+            "redirect_warning",
+            "short_name",
+        ],
+    }
+
+    if not os.path.isfile(path):
+        print(f"Cannot load the config file: {path} does not exist!")
+        return
+
+    with open(path, "r", encoding="utf-8") as fh:
+        context_link_config = yaml.safe_load(fh)
+
+    if not context_link_config:
+        print("The provided config file is empty.")
+        return
+
+    if context_link_config["hardcoded_modules"]:
+        for entry in context_link_config["hardcoded_modules"]:
+            try:
+                validate(
+                    instance=context_link_config["hardcoded_modules"][entry],
+                    schema=hardcoded_modules_schema,
+                )
+                print(f'=> OK: "{entry}"')
+            except (ValidationError, SchemaError) as err:
+                print(f'=> ERROR: "{entry}" >> {err}\n')
+
+    if context_link_config["linked_services"]:
+        for entry in context_link_config["linked_services"]:
+            try:
+                validate(
+                    instance=context_link_config["linked_services"][entry],
+                    schema=linked_services_schema,
+                )
+                print(f'=> OK: "{entry}"')
+            except (ValidationError, SchemaError) as err:
+                print(f'=> ERROR: "{entry}" >> {err}\n')
+
+
+@cli.command(name="searchindex-info")
+@click.option(
+    "--searchindex_id",
+    type=int,
+    required=False,
+    help="Searchindex database ID to search for e.g. 3.",
+)
+@click.option(
+    "--index_name",
+    required=False,
+    help="Searchindex name to search for e.g. 4c5afdf60c6e49499801368b7f238353.",
+)
+def searchindex_info(searchindex_id: int, index_name: str):
+    """Search for a searchindex and print information about it.
+    Especially which sketch the searchindex belongs to. You can either use the
+    searchindex ID or the index name.
+
+
+    Args:
+        searchindex_id (int): The searchindex database ID to search for (e.g.,
+                              "3").
+        index_name (str): The search index ID to search for (e.g.,
+                              "4c5afdf60c6e49499801368b7f238353").
+    """
+    index_to_search = None
+
+    if searchindex_id:
+        index_to_search = SearchIndex.query.filter_by(id=searchindex_id).first()
+    elif index_name:
+        index_to_search = SearchIndex.query.filter_by(index_name=index_name).first()
+    else:
+        print("Please provide either a searchindex ID or an index name")
+        return
+
+    if not index_to_search:
+        print("Searchindex not found in database.")
+        return
+
+    print(
+        f"Searchindex: {index_to_search.id} Name: {index_to_search.name}"
+        f" [Status: {index_to_search.status[-1].status}] found"
+    )
+
+    timelines = index_to_search.timelines
+    if timelines:
+        print("Associated Timelines:")
+        for timeline in timelines:
+            print(
+                f"  ID: {timeline.id}, Name: {timeline.name}"
+                f"[Status: {timeline.status[-1].status}]"
+            )
+            if timeline.sketch:
+                print(
+                    f"    Sketch ID: {timeline.sketch.id}, Name: {timeline.sketch.name}"
+                )
+            else:
+                print("    No associated sketch found.")
+    else:
+        print("No associated timelines found.")
+        return
+
+
+@cli.command(name="searchindex-status")
+@click.option(
+    "--action",
+    default="get",
+    type=click.Choice(["get", "set"]),
+    required=False,
+    help="get or set timeline status.",
+)
+@click.option(
+    "--status",
+    required=False,
+    type=click.Choice(["ready", "processing", "fail"]),
+    help="get or set timeline status.",
+)
+@click.option(
+    "--searchindex_id",
+    required=True,
+    help="Searchindex database ID to search for e.g. 1.",
+)
+def searchindex_status(searchindex_id: str, action: str, status: str):
+    """Get or set a searchindex status.
+
+    If "action" is "set", the given value of status will be written in the status.
+
+    Args:
+        searchindex_id (str): The ID of the search index.
+        action (str): The action to perform ("get" or "set").
+        status (str): The search index status to set ("ready", "processing", or
+                      "fail").
+    """
+    if action == "get":
+        searchindex = SearchIndex.query.filter_by(id=searchindex_id).first()
+        if not searchindex:
+            print("Searchindex does not exist.")
+            return
+        table_data = [
+            [
+                "searchindex_id",
+                "index_name",
+                "created_at",
+                "user_id",
+                "description",
+                "status",
+            ],
+        ]
+        table_data.append(
+            [
+                searchindex.id,
+                searchindex.index_name,
+                searchindex.created_at,
+                searchindex.user_id,
+                searchindex.description,
+                searchindex.status[-1].status,
+            ]
+        )
+        print_table(table_data)
+
+        # Display all historical statuses
+        if searchindex.status:
+            print("\nFull Status Value (only one should be there):")
+            status_history_table_data = [
+                ["ID", "Status", "Created At", "User ID", "Is Latest"],
+            ]
+            latest_status_obj = searchindex.status[-1]
+            for _status_entry in searchindex.status:
+                is_latest_marker = (
+                    "(latest)" if _status_entry == latest_status_obj else ""
+                )
+                status_history_table_data.append(
+                    [
+                        _status_entry.id,
+                        _status_entry.status,
+                        _status_entry.created_at,
+                        _status_entry.user.username if _status_entry.user else "N/A",
+                        is_latest_marker,
+                    ]
+                )
+            print_table(status_history_table_data)
+    elif action == "set":
+        searchindex = SearchIndex.query.filter_by(id=searchindex_id).first()
+        if not searchindex:
+            print("Searchindex does not exist.")
+            return
+        # exit if status is not set
+        if not status:
+            print("Status is not set.")
+            return
+        searchindex.set_status(status)
+        db_session.commit()
+        print(f"Searchindex {searchindex_id} status set to {status}")
+        # to verify run:
+        print(
+            (
+                f"To verify run: tsctl searchindex-status "
+                f"--searchindex_id {searchindex_id} --action get"
+            )
+        )
+
+
+# Analyzer stats cli command
+@cli.command(name="analyzer-stats")
+@click.argument(
+    "analyzer_name",
+    required=False,
+    default="all",
+)
+@click.option(
+    "--timeline_id",
+    type=int,
+    required=False,
+    help="Timeline ID if the analyzer results should be filtered by timeline.",
+)
+@click.option(
+    "--scope",
+    required=False,
+    help="Scope on: [many_hits, long_runtime, recent]",
+)
+@click.option(
+    "--result_text_search",
+    required=False,
+    help="Search in result text. E.g. for a specific rule_id.",
+)
+@click.option(
+    "--limit",
+    required=False,
+    help="Limit the number of results.",
+)
+@click.option(
+    "--export_csv",
+    required=False,
+    help="Export the results to a CSV file.",
+)
+def analyzer_stats(
+    analyzer_name, timeline_id, scope, result_text_search, limit, export_csv
+):
+    """Prints analyzer stats."""
+
+    if timeline_id:
+        timeline = Timeline.get_by_id(timeline_id)
+        if not timeline:
+            print("No timeline found with this ID.")
+            return
+        if analyzer_name == "all":
+            analysis_history = Analysis.query.filter_by(timeline=timeline).all()
+        else:
+            analysis_history = Analysis.query.filter_by(
+                timeline=timeline, analyzer_name=analyzer_name
+            ).all()
+    elif analyzer_name == "all":
+        analysis_history = Analysis.query.filter_by().all()
+    else:
+        # analysis filter by analyzer_name
+        analysis_history = Analysis.query.filter_by(analyzer_name=analyzer_name).all()
+
+    df = pd.DataFrame()
+    for analysis in analysis_history:
+        # extract number of hits from result to a int so it could be sorted
+        # TODO: make this more generic as the number of events might only
+        # be a part of the result string in Sigma analyzers
+        try:
+            matches = int(re.search(r"\d+(?=\s+events)", analysis.result))
+        except TypeError:
+            matches = 0
+        new_row = pd.DataFrame(
+            [
+                {
+                    "analyzer_name": analysis.analyzer_name,
+                    "runtime": analysis.updated_at - analysis.created_at,
+                    "hits": matches,
+                    "timeline_id": analysis.timeline_id,
+                    "analysis_id": analysis.id,
+                    "created_at": analysis.created_at,
+                    "result": analysis.result,
+                }
+            ]
+        )
+        df = pd.concat([df, new_row], ignore_index=True)
+
+    if df.empty:
+        print("No Analyzer runs found!")
+        return
+
+    # make the runtime column to only display in minutes and cut away days etc.
+    df["runtime"] = df["runtime"].dt.seconds / 60
+
+    if result_text_search:
+        df = df[df.result.str.contains(result_text_search, na=False)]
+
+    # Sorting the dataframe depending on the parameters
+
+    if scope in ["many_hits", "many-hits", "hits"]:
+        if analyzer_name == "sigma":
+            df = df.sort_values("hits", ascending=False)
+        else:
+            print("Sorting by hits is only possible for sigma analyzer.")
+            df = df.sort_values("runtime", ascending=False)
+    elif scope == "long_runtime":
+        df = df.sort_values("runtime", ascending=False)
+    elif scope == "recent":
+        df = df.sort_values("created_at", ascending=False)
+    else:
+        df = df.sort_values("runtime", ascending=False)
+
+    if limit:
+        df = df.head(int(limit))
+
+    # remove hits column if analyzer_name is not sigma
+    if analyzer_name != "sigma":
+        df = df.drop(columns=["hits"])
+
+    if export_csv:
+        df.to_csv(export_csv, index=False)
+        print(f"Analyzer stats exported to {export_csv}")
+    else:
+        pd.options.display.max_colwidth = 500
+        print(df)
+
+
+def _get_analysis_id_from_task(task: dict) -> Optional[int]:
+    """Extracts the analysis ID from a Celery task dictionary.
+
+    Args:
+        task: A dictionary representing a Celery task.
+
+    Returns:
+        The analysis ID as an integer if found, otherwise None.
+    """
+    analysis_id = None
+    task_kwargs = task.get("kwargs", {})
+    task_args = task.get("args", [])
+
+    if task_kwargs.get("analysis_id") is not None:
+        analysis_id = task_kwargs["analysis_id"]
+    elif len(task_args) >= 3 and task_args[2] is not None:
+        analysis_id = task_args[2]
+
+    if analysis_id is not None:
+        try:
+            return int(analysis_id)
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+@cli.command(name="list-analyzer-runs")
+@click.argument("sketch_id", type=int)
+@click.option(
+    "--show-all",
+    is_flag=True,
+    default=False,
+    help="Show all analyzer runs, including completed and failed ones.",
+)
+def list_analyzer_runs(sketch_id: int, show_all: bool) -> None:
+    """List analyzer runs for a specific sketch.
+
+    By default, only PENDING runs are shown. Use --show-all to see all runs.
+
+    Args:
+        sketch_id: The ID of the sketch to list runs for.
+        show_all: If true, show all analyzer runs, including completed and
+            failed ones.
+    """
+    sketch = Sketch.get_by_id(sketch_id)
+    if not sketch:
+        print(f"Sketch {sketch_id} not found.")
+        return
+
+    print("Inspecting Celery workers for active tasks...")
+    celery_app = create_celery_app()
+    inspector = celery_app.control.inspect()
+    running_analyses = {}
+
+    try:
+        # Helper to process task lists
+        def _process_tasks(tasks_by_worker, state_label):
+            if not tasks_by_worker:
+                return
+            for worker, tasks in tasks_by_worker.items():
+                for task in tasks:
+                    analysis_id = _get_analysis_id_from_task(task)
+                    if analysis_id is not None:
+                        status_string = (
+                            f"{state_label} ({worker})"  # pylint: disable=line-too-long
+                        )
+                        running_analyses[analysis_id] = status_string
+
+        _process_tasks(inspector.active(), "Active")
+        _process_tasks(inspector.reserved(), "Reserved")
+        _process_tasks(inspector.scheduled(), "Scheduled")
+
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"Warning: Could not inspect Celery tasks: {e}")
+
+    print(f"Analyzer runs for sketch {sketch.id} ({sketch.name}):")
+    if not show_all:
+        print("(Showing only PENDING runs. Use --show-all to see everything)")
+
+    table_data = [
+        [
+            "ID",
+            "Analyzer",
+            "Timeline ID",
+            "Status",
+            "Celery Status",
+            "Created At",
+            "Updated At",
+        ]
+    ]
+
+    # Build the base query for Analysis objects related to the sketch
+    analysis_query = Analysis.query.filter_by(sketch=sketch)
+
+    # If --show-all is not used, filter for PENDING status
+    if not show_all:
+        analysis_query = analysis_query.join(Analysis.status).filter(
+            Analysis.Status.status == "PENDING"
+        )
+
+    # Fetch and sort the results for consistent output
+    analysis_runs = analysis_query.order_by(Analysis.id.asc()).all()
+
+    for analysis in analysis_runs:
+        status = analysis.get_status.status
+
+        celery_status = ""
+        if status == "PENDING":
+            celery_status = running_analyses.get(analysis.id, "Pending (no worker)")
+        else:
+            celery_status = "N/A"
+
+        table_data.append(
+            [
+                analysis.id,
+                analysis.analyzer_name,
+                analysis.timeline_id,
+                status,
+                celery_status,
+                analysis.created_at,
+                analysis.updated_at,
+            ]
+        )
+
+    print_table(table_data)
+
+
+def _find_and_revoke_task(analysis_id, celery_app, inspector):
+    """Finds and revokes a Celery task for a given analysis ID.
+
+    Args:
+        analysis_id (int): The ID of the analysis run.
+        celery_app (Celery): The Celery application instance.
+        inspector (Celery.control.inspect): The Celery inspector instance.
+
+    Returns:
+        bool: True if a task was found and revoked, False otherwise.
+    """
+    search_targets = [
+        (inspector.active(), True, "active"),
+        (inspector.reserved(), False, "reserved"),
+        (inspector.scheduled(), False, "scheduled"),
+    ]
+
+    print("Searching Celery tasks (active, reserved, scheduled)...")
+
+    for tasks_dict, is_active, state_name in search_targets:
+        if not tasks_dict:
+            continue
+
+        for worker_name, tasks in tasks_dict.items():
+            for task in tasks:
+                celery_analysis_id = _get_analysis_id_from_task(task)
+
+                if celery_analysis_id == analysis_id:
+                    task_id = task["id"]
+                    print(
+                        f"Found {state_name} task {task_id} on worker {worker_name} "
+                        f"for analysis {analysis_id}."
+                    )
+                    print(f"Revoking task (terminate={is_active})...")
+                    celery_app.control.revoke(task_id, terminate=is_active)
+                    print("Task revoked.")
+                    return True
+    return False
+
+
+@cli.command(name="manage-analyzer-run")
+@click.argument("analysis_ids")
+@click.option(
+    "--status",
+    required=False,
+    type=click.Choice(["ERROR", "DONE", "STARTED"], case_sensitive=False),
+    help="Set the status of the analysis.",
+)
+@click.option(
+    "--kill",
+    is_flag=True,
+    default=False,
+    help="Attempt to find and revoke (kill) the active or queued Celery task for this analysis.",  # pylint: disable=line-too-long
+)
+def manage_analyzer_run(analysis_ids, status, kill):
+    """Manage a specific analyzer run or multiple runs.
+    Allows setting the status of analysis runs and/or killing the associated
+    Celery tasks if they are currently active or queued.
+    """
+    analysis_id_list = []
+    for an_id_str in analysis_ids.split(","):
+        try:
+            analysis_id_list.append(int(an_id_str.strip()))
+        except ValueError:
+            print(f"Invalid analysis ID: {an_id_str}. Skipping.")
+            continue
+    if not analysis_id_list:
+        print("No valid analysis IDs provided.")
+        return
+
+    for analysis_id in analysis_id_list:
+        analysis = Analysis.get_by_id(analysis_id)
+        if not analysis:
+            print(f"Analysis with ID {analysis_id} not found. Skipping.")
+            continue
+
+        print(
+            f"Processing Analysis {analysis.id} ({analysis.analyzer_name}) "
+            f"on Timeline {analysis.timeline_id}"
+        )
+
+        print(f"Current Status: {analysis.get_status.status}")
+
+        if kill:
+            celery_app = create_celery_app()
+            inspector = celery_app.control.inspect()
+
+            task_found = _find_and_revoke_task(analysis.id, celery_app, inspector)
+
+            if task_found:
+                if not status:
+                    print("Setting analysis status to 'ERROR' due to kill.")
+                    status = "ERROR"
+            else:
+                print(
+                    f"No active, reserved, or scheduled Celery task found for "
+                    f"analysis {analysis.id}."
+                )
+                if not status:
+                    print(
+                        "Task not found in queue. To force the DB status to ERROR, "
+                        "run this command again with --status ERROR."
+                    )
+
+        if status:
+            old_result = analysis.result or ""
+            current_utc_timestamp = datetime.datetime.now(
+                datetime.timezone.utc
+            ).isoformat()
+            status_message = (
+                f"(Status manually set to {status} via tsctl on "
+                f"{current_utc_timestamp})"
+            )
+
+            try:
+                result_dict = json.loads(old_result)
+                if isinstance(result_dict, dict):
+                    result_dict.setdefault("status_updates", []).append(status_message)
+                    new_result = json.dumps(result_dict)
+                else:
+                    new_result = f"{old_result}\n{status_message}"
+            except json.JSONDecodeError:
+                new_result = f"{old_result}\n{status_message}"
+
+            analysis.result = new_result
+            analysis.set_status(status)
+            analysis.updated_at = datetime.datetime.now(datetime.timezone.utc)
+            db_session.add(analysis)
+            db_session.commit()
+            print(f"Analysis {analysis.id} status updated to: {status}")
+
+        print(
+            "\n"
+        )  # Add a newline for better separation between processing multiple analyses
+
+
+@cli.command(name="celery-tasks-redis")
+def celery_tasks_redis():
+    """Check and display the status of all Celery tasks stored in Redis.
+
+    This command connects to the Redis instance used by Celery to store
+    task metadata and retrieves information about all tasks. It then
+    presents this information in a formatted table, including the task ID,
+    name, status, and result.
+
+    The command handles potential connection errors to Redis and gracefully
+    exits if no tasks are found. It also handles exceptions that might occur
+    when retrieving task details, displaying "N/A" for any unavailable
+    information.
+
+    Note: Celery tasks have a `result_expire` date, which by default is
+        one day. After that, the results will no longer be available.
+
+    """
+    celery = create_celery_app()
+    redis_url = celery.conf.broker_url
+
+    try:
+        redis_client = redis.from_url(redis_url)
+    except redis.exceptions.ConnectionError:
+        print("Could not connect to Redis.")
+        return
+
+    # Get all keys matching the pattern for Celery task metadata
+    task_meta_keys = redis_client.keys("celery-task-meta-*")
+
+    if not task_meta_keys:
+        print("No Celery tasks found in Redis.")
+        return
+
+    table_data = [["Task ID", "Name", "Status", "Result"]]
+    for key in task_meta_keys:
+        task_id = key.decode("utf-8").split("celery-task-meta-")[1]
+        task_result = AsyncResult(task_id, app=celery)
+
+        try:
+            task_name = task_result.name
+        except Exception:  # pylint: disable=broad-except
+            task_name = "N/A"
+
+        try:
+            task_status = task_result.status
+        except Exception:  # pylint: disable=broad-except
+            task_status = "N/A"
+
+        try:
+            task_result_value = str(task_result.result)
+        except Exception:  # pylint: disable=broad-except
+            task_result_value = "N/A"
+
+        table_data.append([task_id, task_name, task_status, task_result_value])
+
+    max_lengths = [0] * len(table_data[0])
+    for row in table_data:
+        for i, cell in enumerate(row):
+            max_lengths[i] = max(max_lengths[i], len(str(cell)))
+
+    # create the table
+    for row in table_data:
+        for i, cell in enumerate(row):
+            print(str(cell).ljust(max_lengths[i]), end=" ")
+        print()
+
+
+@cli.command(name="celery-tasks")
+@click.option(
+    "--task_id",
+    required=False,
+    help="Show information about a specific task ID.",
+)
+@click.option(
+    "--active",
+    is_flag=True,
+    help="Show only active tasks.",
+)
+@click.option(
+    "--show_all",
+    is_flag=True,
+    help="Show all tasks, including pending, active, and failed.",
+)
+def celery_tasks(task_id, active, show_all):
+    """Show running or past Celery tasks.
+    This command provides various ways to inspect and view the status of
+    Celery tasks within the Timesketch application. It can display
+    information about a specific task, list active tasks, show all tasks
+    (including pending, active, and failed).
+
+    Args:
+        task_id (str): If provided, display detailed information about the
+            task with this ID.
+        active (bool): If True, display only currently active tasks.
+        show_all (bool): If True, display all tasks, including active, pending,
+            reserved, scheduled, and failed tasks.
+
+    Notes:
+        - Celery tasks have a `result_expire` date, which defaults to one day.
+          After this period, task results may no longer be available.
+        - When displaying all tasks, the status of each task is retrieved,
+          which may take some time.
+        - If no arguments are provided, it will print a message to use
+            --active or --show_all.
+
+    Examples:
+        # Show information about a specific task:
+        tsctl celery-tasks --task_id <task_id>
+
+        # Show all active tasks:
+        tsctl celery-tasks --active
+
+        # Show all tasks (including pending, active, and failed):
+        tsctl celery-tasks --show_all
+    """
+    celery = create_celery_app()
+
+    if task_id:
+        # Show information about a specific task
+        task_result = AsyncResult(task_id, app=celery)
+        print(f"Task ID: {task_id}")
+        print(f"Status: {task_result.status}")
+        if task_result.status == "FAILURE":
+            print(f"Traceback: {task_result.traceback}")
+        if task_result.status == "SUCCESS":
+            print(f"Result: {task_result.result}")
+        return
+
+    # Show a list of tasks
+    inspector = celery.control.inspect()
+
+    if active:
+        active_tasks = inspector.active()
+        if not active_tasks:
+            print("No active tasks found.")
+            return
+        table_data = [["Task ID", "Name", "Time Start", "Worker name"]]
+        for worker_name, tasks in active_tasks.items():
+            for task in tasks:
+                table_data.append(
+                    [
+                        task["id"],
+                        task["name"],
+                        time.strftime(
+                            "%Y-%m-%d %H:%M:%S", time.localtime(task["time_start"])
+                        ),
+                        worker_name,
+                    ]
+                )
+        print_table(table_data)
+        return
+
+    if show_all:
+        # Show all tasks (active, pending, reserved, scheduled, failed)
+        all_tasks = {}
+        all_tasks.update(inspector.active() or {})
+        all_tasks.update(inspector.reserved() or {})
+        all_tasks.update(inspector.scheduled() or {})
+
+        if not all_tasks:
+            print("No tasks found.")
+            return
+
+        table_data = [["Task ID", "Name", "Status", "Time Start", "Worker name"]]
+        for worker_name, tasks in all_tasks.items():
+            for task in tasks:
+                task_id = task["id"]
+                task_result = AsyncResult(task_id, app=celery)
+                status = task_result.status
+                time_start = task.get("time_start", "N/A")
+                if time_start != "N/A":
+                    time_start = time.strftime(
+                        "%Y-%m-%d %H:%M:%S", time.localtime(time_start)
+                    )
+                table_data.append(
+                    [
+                        task_id,
+                        task["name"],
+                        status,
+                        time_start,
+                        worker_name,
+                    ]
+                )
+        print_table(table_data)
+        return
+
+    print("Please use --active or --show_all to show tasks")
+
+
+@cli.command(name="celery-revoke-task")
+@click.argument("task_id")
+def celery_revoke_task(task_id):
+    """Revoke (cancel) a Celery task.
+
+     This command attempts to revoke a running Celery task, effectively
+    canceling its execution.  It uses the task ID to identify the specific
+    task to revoke. If the task is successfully revoked, a confirmation
+    message is printed. If an error occurs during the revocation process,
+    an error message is displayed.
+
+    Args:
+        task_id (str): The ID of the Celery task to revoke.
+
+    Raises:
+        Exception: If there is an error communicating with Celery or if the
+            task cannot be revoked.
+
+    """
+    celery = create_celery_app()
+    try:
+        celery.control.revoke(task_id, terminate=True)
+        print(f"Task {task_id} has been revoked.")
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"Error revoking task {task_id}: {e}")
+
+
+@cli.command(name="list-config")
+def list_config():
+    """List all configuration variables loaded by the Flask application.
+
+    This command iterates through the application's configuration dictionary
+    (current_app.config). It identifies keys associated with potentially
+    sensitive information (e.g., passwords, API keys, secrets) based on a
+    predefined list of keywords.
+
+    The values corresponding to these sensitive keys are redacted and replaced
+    with '******** (redacted)' before printing. All other configuration
+    key-value pairs are printed as they are.
+
+    The output is formatted for readability, showing each configuration key
+    followed by its (potentially redacted) value.
+    """
+    print("Timesketch Configuration Variables:")
+    print("-" * 35)
+    # Keywords/patterns to identify sensitive keys (case-insensitive)
+    sensitive_keywords = [
+        "SECRET",
+        "PASSWORD",
+        "API_KEY",
+        "TOKEN",
+        "CREDENTIALS",
+        "AUTH",
+        "KEYFILE",
+        "SQLALCHEMY_DATABASE_URI",
+    ]
+
+    # Compile a regex pattern for efficiency
+    sensitive_pattern = re.compile("|".join(sensitive_keywords), re.IGNORECASE)
+
+    # Sort items for consistent output
+    config_items = sorted(current_app.config.items())
+    for key, value in config_items:
+        display_value = value
+
+        # Check if the key matches any sensitive patterns
+        if sensitive_pattern.search(key):
+            display_value = "******** (redacted)"
+
+        print(f"{key}: {display_value}")
+    print("-" * 35)
+    print("Note: Some values might be sensitive (e.g., SECRET_KEY, passwords).")
+
+
+def _isoformat_or_none(dt: Optional[datetime.datetime]) -> Optional[str]:
+    """Return ISO format of a datetime object, or None if the object is None.
+
+    Example:
+        _isoformat_or_none(datetime.datetime.now()) == '2024-01-01T12:00:00'
+    """
+    return dt.isoformat() if dt else None
+
+
+# Helper function to gather sketch metadata
+def _get_sketch_metadata(sketch: Sketch) -> dict:
+    """Gathers comprehensive metadata for a given Timesketch sketch.
+    This function collects various details about the sketch, its associated
+    objects (timelines, views, stories, aggregations, etc.), permissions,
+    and export context into a structured dictionary.
+    Args:
+        sketch: The timesketch.models.sketch.Sketch object to extract metadata from.
+    Returns:
+        A dictionary containing metadata about the sketch, including:
+            - Basic sketch info (ID, name, description, status, timestamps, owner).
+            - Permissions and sharing details.
+            - List of associated timelines with their details (including data sources).
+            - List of saved views (name, query, filter, DSL).
+            - List of stories (title, content).
+            - List of aggregations and aggregation groups.
+            - List of saved graphs.
+            - List of analysis sessions.
+            - List of DFIQ scenarios (including nested facets, questions, etc.).
+            - Sketch attributes.
+            - Export timestamp and Timesketch version.
+            - Comments.
+    """
+    # Schemas for marshalling, from the API resource mixin
+    schemas = ResourceMixin.fields_registry
+    print("Gathering metadata...")
+    metadata = {
+        "sketch_id": sketch.id,
+        "name": sketch.name,
+        "description": sketch.description,
+        "status": sketch.get_status.status,
+        "created_at": _isoformat_or_none(sketch.created_at),
+        "updated_at": _isoformat_or_none(sketch.updated_at),
+        "created_by": sketch.user.username if sketch.user else None,
+        "is_public": bool(sketch.is_public),
+        "labels": [label.label for label in sketch.labels],
+        "acls": sketch.get_all_permissions(),
+        "timelines": [],
+        "views": [],
+        "stories": [],
+        "aggregations": [],
+        "aggregation_groups": [],
+        "graphs": [],
+        "analysis_sessions": [],
+        "scenarios": [],
+        "comments": [],
+        "attributes": api_utils.get_sketch_attributes(sketch),
+        "export_timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "timesketch_version": version.get_version(),
+    }
+
+    # Timelines
+    timelines = list(sketch.timelines)
+    if timelines:
+        print(f"  Processing {len(timelines)} timeline(s)...")
+        for timeline in timelines:
+            marshalled_timeline = marshal(timeline, schemas["timeline"])
+            metadata["timelines"].append(marshalled_timeline)
+
+    # Views
+    named_views = sketch.get_named_views
+    if named_views:
+        print(f"  Processing {len(named_views)} saved view(s)...")
+        for view in named_views:
+            marshalled_view = marshal(view, schemas["view"])
+            metadata["views"].append(marshalled_view)
+
+    # Stories
+    stories = list(sketch.stories)
+    if stories:
+        print(f"  Processing {len(stories)} story(ies)...")
+        for story in stories:
+            marshalled_story = marshal(story, schemas["story"])
+            metadata["stories"].append(marshalled_story)
+    else:
+        print("  No stories found for this sketch.")
+
+    # Aggregations
+    aggregations = list(sketch.aggregations)
+    if aggregations:
+        print(f"  Processing {len(aggregations)} aggregation(s)...")
+        for agg in aggregations:
+            marshalled_agg = marshal(agg, schemas["aggregation"])
+            metadata["aggregations"].append(marshalled_agg)
+
+    # Aggregation Groups
+    aggregation_groups = list(sketch.aggregationgroups)
+    if aggregation_groups:
+        print(f"  Processing {len(aggregation_groups)} aggregation group(s)...")
+        for group in aggregation_groups:
+            marshalled_group = marshal(group, schemas["aggregationgroup"])
+            metadata["aggregation_groups"].append(marshalled_group)
+
+    # Graphs
+    graphs = list(sketch.graphs)
+    if graphs:
+        print(f"  Processing {len(graphs)} saved graph(s)...")
+        for graph in graphs:
+            marshalled_graph = marshal(graph, schemas["graph"])
+            metadata["graphs"].append(marshalled_graph)
+
+    # Comments
+    # Fetch Event DB objects that are part of the sketch and have comments.
+    results = Event.get_with_comments(sketch=sketch)
+    events_with_comments_list = results.all() if hasattr(results, "all") else results
+
+    if events_with_comments_list:
+        print(f"  Processing comments for {len(events_with_comments_list)} event(s)...")
+        for db_event_with_comment in events_with_comments_list:
+            for comment_obj in db_event_with_comment.comments:
+                metadata["comments"].append(
+                    {
+                        "id": comment_obj.id,  # Comment's own SQL PK
+                        "comment": comment_obj.comment,
+                        "user": (
+                            comment_obj.user.username if comment_obj.user else None
+                        ),
+                        "created_at": _isoformat_or_none(comment_obj.created_at),
+                        "updated_at": _isoformat_or_none(comment_obj.updated_at),
+                        # SQL PK of the Event object
+                        "event_id": db_event_with_comment.id,
+                        # OpenSearch _id
+                        "event_uuid": db_event_with_comment.document_id,
+                    }
+                )
+    else:
+        print("  No events with comments found for this sketch.")
+
+    # Analysis Sessions (and their analyses)
+    print("  Processing analysis sessions...")
+    analysis_sessions = (
+        AnalysisSession.query.join(Analysis)
+        .join(Timeline)
+        .filter(Timeline.sketch_id == sketch.id)
+        .distinct()
+        .all()
+    )
+    for session in analysis_sessions:
+        metadata["analysis_sessions"].append(
+            marshal(session, schemas["analysissession"])
+        )
+
+    # DFIQ Scenarios (and their nested facets, questions, etc.)
+    scenarios = list(sketch.scenarios)
+    if scenarios:
+        print(f"  Processing {len(scenarios)} DFIQ scenario(s)...")
+        for scenario in scenarios:
+            metadata["scenarios"].append(marshal(scenario, schemas["scenario"]))
+
+    return metadata
+
+
+# Helper function to fetch and prepare event data
+def _calculate_export_counts(
+    sketch: Sketch,
+    datastore: OpenSearchDataStore,
+    active_indices: List[str],
+    active_tids: List[int],
+    method: str,
+    include_legacy: bool,
+    annotation_filter: Optional[Dict],
+) -> Tuple[int, int, Optional[Dict]]:
+    """Calculates expected event counts for the export.
+
+    Args:
+        sketch: The Sketch database model.
+        datastore: OpenSearchDataStore instance.
+        active_indices: List of index names.
+        active_tids: List of timeline IDs.
+        method: Export method (direct or api).
+        include_legacy: Whether to include events missing __ts_timeline_id.
+        annotation_filter: Optional OpenSearch DSL for annotations.
+
+    Returns:
+        A tuple containing:
+            - total_expected (int): Total number of events to be exported.
+            - legacy_count (int): Number of legacy events detected.
+            - verification_query_dsl (dict): Query DSL to use for spot checks.
+    """
+    total_expected = 0
+    legacy_count = 0
+    verification_query_dsl = None
+
+    # Filter out closed indices to avoid errors
+    open_indices = _get_open_indices(datastore, active_indices)
+
+    if not open_indices:
+        print("    Note: No open indices to count.")
+        return 0, 0, None
+
+    # Count modern events
+    for tid in active_tids:
+        query_dsl = {"query": {"bool": {"must": [{"term": {"__ts_timeline_id": tid}}]}}}
+        if annotation_filter:
+            query_dsl["query"]["bool"]["must"].append(annotation_filter)
+
+        if not verification_query_dsl:
+            verification_query_dsl = query_dsl
+
+        count = datastore.search(
+            sketch_id=sketch.id,
+            indices=open_indices,
+            query_dsl=query_dsl,
+            count=True,
+        )
+        total_expected += count
+
+    # Count legacy events (missing __ts_timeline_id)
+    legacy_query = {
+        "query": {"bool": {"must_not": [{"exists": {"field": "__ts_timeline_id"}}]}}
+    }
+    if annotation_filter:
+        legacy_query["query"]["bool"]["must"] = [annotation_filter]
+
+    for index_name in open_indices:
+        try:
+            c_res = datastore.client.count(index=index_name, body=legacy_query)
+            legacy_count += c_res.get("count", 0)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                "Could not count events for index %s: %s. "
+                "This might lead to a mismatch in the total event count.",
+                index_name,
+                str(e),
+            )
+
+    if method == "direct":
+        if include_legacy:
+            total_expected += legacy_count
+        elif legacy_count > 0:
+            click.echo(
+                click.style(
+                    f"\nNOTE: Found {legacy_count:,} legacy events "
+                    "(missing __ts_timeline_id). These will be SKIPPED. "
+                    "Use --include-legacy to include them.\n",
+                    fg="cyan",
+                ),
+                err=True,
+            )
+    else:
+        # API method always returns legacy events if present
+        total_expected += legacy_count
+        if legacy_count > 0 and verification_query_dsl:
+            should_clause = verification_query_dsl["query"]["bool"]["must"][0]
+            verification_query_dsl["query"]["bool"]["must"] = [
+                {
+                    "bool": {
+                        "should": [
+                            should_clause,
+                            {
+                                "bool": {
+                                    "must_not": {
+                                        "exists": {"field": "__ts_timeline_id"}
+                                    }
+                                }
+                            },
+                        ]
+                    }
+                }
+            ]
+            if annotation_filter:
+                verification_query_dsl["query"]["bool"]["must"].append(
+                    annotation_filter
+                )
+
+    return total_expected, legacy_count, verification_query_dsl
+
+
+def _export_index_mappings(
+    datastore: OpenSearchDataStore, active_indices: List[str], target_dir: str
+) -> None:
+    """Collect index mappings and save as JSON files.
+
+    Args:
+        datastore: OpenSearchDataStore instance.
+        active_indices: List of index names to fetch mappings for.
+        target_dir: Base directory for export files.
+    """
+    mappings_dir = os.path.join(target_dir, "mappings")
+    try:
+        os.makedirs(mappings_dir, exist_ok=True)
+    except OSError as e:
+        click.echo(f"  Warning: Could not create mappings directory: {e!s}", err=True)
+        return
+
+    open_indices = _get_open_indices(datastore, active_indices)
+
+    for index_name in active_indices:
+        if index_name not in open_indices:
+            print(f"    Note: Index {index_name} is closed, skipping mapping.")
+            continue
+        try:
+            mapping = datastore.client.indices.get_mapping(index=index_name)
+            m_path = os.path.join(mappings_dir, f"{index_name}.json")
+            with open(m_path, "w", encoding="utf-8") as f_map:
+                json.dump(mapping, f_map, indent=2)
+        except (IOError, OSError) as e:
+            click.echo(f"    WARNING: Failed to save mapping for {index_name}: {e!s}")
+        except Exception as e:  # pylint: disable=broad-except
+            click.echo(f"    WARNING: Mapping retrieval failed for {index_name}: {e!s}")
+
+
+def _export_stories_to_markdown(sketch: Sketch, target_dir: str) -> None:
+    """Export sketch stories as individual Markdown files.
+
+    Args:
+        sketch: The Sketch database model.
+        target_dir: The base directory where the stories should be saved.
+    """
+    stories_dir = os.path.join(target_dir, "stories")
+    try:
+        os.makedirs(stories_dir, exist_ok=True)
+    except OSError as e:
+        click.echo(f"  Warning: Could not create stories directory: {e!s}", err=True)
+        return
+
+    for story in sketch.stories:
+        # Generate a safe filename from the story title
+        safe_title = re.sub(r"[^a-zA-Z0-9]", "_", story.title)
+        s_name = f"story_{story.id}_{safe_title}.md"
+        story_path = os.path.join(stories_dir, s_name)
+
+        story_content = story.content or ""
+        author = story.user.username if story.user else "System"
+
+        # Handle newer block-based stories (JSON) vs legacy (raw Markdown)
+        if story_content.startswith("["):
+            try:
+                data_fetcher = story_api_fetcher.ApiDataFetcher()
+                data_fetcher.set_sketch_id(sketch.id)
+                with markdown_story_exporter.MarkdownStoryExporter() as exporter:
+                    exporter.set_data_fetcher(data_fetcher)
+                    exporter.from_string(story_content)
+                    story_content = exporter.export_story()
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                click.echo(
+                    f"  Warning: Failed to parse block-based story {story.id}: "
+                    f"{e!s}. Exporting raw content.",
+                    err=True,
+                )
+
+        # Save raw content as JSON for archival safety
+        raw_name = f"story_{story.id}_{safe_title}.json"
+        raw_path = os.path.join(stories_dir, raw_name)
+        try:
+            with open(raw_path, "w", encoding="utf-8") as f_raw:
+                # We save a simple dict with metadata and raw content
+                json.dump(
+                    {
+                        "id": story.id,
+                        "title": story.title,
+                        "author": author,
+                        "created_at": story.created_at.isoformat(),
+                        "content": story.content,
+                    },
+                    f_raw,
+                    indent=2,
+                )
+        except (IOError, OSError) as e:
+            click.echo(
+                f"  Warning: Failed to export raw story {story.id}: {e!s}",
+                err=True,
+            )
+
+        try:
+            with open(story_path, "w", encoding="utf-8") as f_story:
+                f_story.write(f"# {story.title}\n\n")
+                f_story.write(f"**Author:** {author}\n")
+                f_story.write(f"**Created:** {story.created_at.isoformat()}\n\n")
+                f_story.write(story_content)
+        except (IOError, OSError) as e:
+            click.echo(
+                f"  Warning: Failed to export story {story.id} to {story_path}: {e!s}",
+                err=True,
+            )
+
+
+def _generate_forensic_manifest(
+    sketch: Sketch,
+    method: str,
+    event_count: int,
+    event_filename: str,
+    event_hash: str,
+    tmp_dir: str,
+) -> None:
+    """Generate manifest.txt with SHA256 hashes for the export archive.
+
+    Args:
+        sketch: The Sketch database model.
+        method: The export method used (direct or api).
+        event_count: Number of events exported.
+        event_filename: Name of the event data file.
+        event_hash: SHA256 hash of the event data file.
+        tmp_dir: Directory containing all export files.
+    """
+    manifest_path = os.path.join(tmp_dir, "manifest.txt")
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f_man:
+            f_man.write("Timesketch Export Manifest\n")
+            f_man.write("==================================\n")
+            f_man.write(f"Sketch ID: {sketch.id} | Name: {sketch.name}\n")
+            timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            f_man.write(f"Date: {timestamp}\n")
+            f_man.write(f"Method: {method} | Events: {event_count}\n\n")
+            f_man.write("File Hashes (SHA256):\n")
+            f_man.write(f"{event_hash}  {event_filename}\n")
+
+            for root, _, files in os.walk(tmp_dir):
+                for f in files:
+                    if f in [event_filename, "manifest.txt", "export.zip"]:
+                        continue
+                    abs_p = os.path.join(root, f)
+                    rel_p = os.path.relpath(abs_p, tmp_dir)
+                    try:
+                        f_man.write(f"{get_sha256(abs_p)}  {rel_p}\n")
+                    except Exception as e:  # pylint: disable=broad-except
+                        click.echo(
+                            f"  Warning: Could not hash file {rel_p}: {e!s}", err=True
+                        )
+    except (IOError, OSError) as e:
+        click.echo(f"  Warning: Failed to create manifest: {e!s}", err=True)
+
+
+def _bundle_export_zip(tmp_dir: str, output_zip_path: str) -> None:
+    """Bundle all files in tmp_dir into a single ZIP archive.
+
+    Args:
+        tmp_dir: Directory containing all files to be bundled.
+        output_zip_path: Path where the resulting ZIP file should be saved.
+    """
+    try:
+        with zipfile.ZipFile(output_zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for root, _, files in os.walk(tmp_dir):
+                for f in files:
+                    # Avoid adding the output zip itself to the archive
+                    if f == "export.zip" or f == os.path.basename(output_zip_path):
+                        continue
+                    abs_p = os.path.join(root, f)
+                    rel_p = os.path.relpath(abs_p, tmp_dir)
+                    try:
+                        zipf.write(abs_p, rel_p)
+                    except (IOError, OSError) as e:
+                        click.echo(
+                            f"  Warning: Could not add {rel_p} to ZIP: {e!s}", err=True
+                        )
+    except (IOError, OSError, zipfile.BadZipFile) as e:
+        click.echo(f"  Error: Failed to create ZIP archive: {e!s}", err=True)
+        raise click.Abort() from e
+
+
+def _fetch_and_prepare_event_data(
+    sketch: Sketch,
+    datastore: OpenSearchDataStore,
+    return_fields: list,
+    output_format: str = "csv",
+    query_dsl: Optional[Dict] = None,
+) -> Tuple[Union[str, "pd.DataFrame"], int, Dict]:
+    """Fetches all event data for a sketch using the API method.
+
+    This is a helper for the 'api' export method. It calls the standard
+    Timesketch API export utility.
+
+    Args:
+        sketch: The Sketch database model.
+        datastore: OpenSearchDataStore instance.
+        return_fields: List of fields to return.
+        output_format: Requested format (csv or jsonl).
+        query_dsl: Optional OpenSearch DSL to filter the export. This allows
+            for complex filtering (e.g. by labels, stars, or comments) that
+            the standard query string cannot express.
+
+    Returns:
+        A tuple containing (data_handle, 0, {})
+    """
+    query_string = "*"
+    if query_dsl:
+        query_string = ""
+
+    query_filter = {
+        "indices": "_all",
+        "size": 10000,
+    }
+
+    active_indices = list({t.searchindex.index_name for t in sketch.active_timelines})
+
+    # Filter out closed indices to avoid errors
+    open_indices = _get_open_indices(datastore, active_indices)
+    open_timeline_ids = [
+        t.id
+        for t in sketch.active_timelines
+        if t.searchindex.index_name in open_indices
+    ]
+
+    # Check if the currently loaded api_export supports output_format
+    sig = inspect.signature(api_export.query_to_filehandle)
+    if "output_format" in sig.parameters:
+        event_file_handle = api_export.query_to_filehandle(
+            query_string=query_string,
+            query_filter=query_filter,
+            query_dsl=query_dsl,
+            indices=open_indices,
+            timeline_ids=open_timeline_ids,
+            sketch=sketch,
+            datastore=datastore,
+            return_fields=return_fields,
+            output_format=output_format,
+        )
+    else:
+        if output_format.lower() != "csv":
+            raise ValueError(
+                f"The currently loaded API export method only supports CSV, "
+                f"but '{output_format}' was requested. Please use --method=direct "
+                f"for high-speed JSONL export."
+            )
+        event_file_handle = api_export.query_to_filehandle(
+            query_string=query_string,
+            query_filter=query_filter,
+            query_dsl=query_dsl,
+            indices=open_indices,
+            timeline_ids=open_timeline_ids,
+            sketch=sketch,
+            datastore=datastore,
+            return_fields=return_fields,
+        )
+    return event_file_handle, 0, {}
+
+
+@cli.command(name="export-sketch")
+@click.argument("sketch_id", type=int)
+@click.option(
+    "--output-format",
+    type=click.Choice(["csv", "jsonl"], case_sensitive=False),
+    default="csv",
+    help="Format for event data export (csv or jsonl). Default: csv",
+)
+@click.option(
+    "--method",
+    type=click.Choice(["api", "direct"], case_sensitive=False),
+    default="api",
+    help="Export method: 'api' (standard) or 'direct' (high-speed OpenSearch scan).",
+)
+@click.option(
+    "--filename",
+    required=False,
+    help=(
+        "Filename for the output zip archive. "
+        f"(Default: {DEFAULT_EXPORT_ARCHIVE_FILENAME_TEMPLATE})"
+    ),
+)
+@click.option(
+    "--default-fields",
+    is_flag=True,
+    default=False,
+    help=(
+        "Export only the default set of event fields. "
+        "If not specified, all fields are exported."
+    ),
+)
+@click.option(
+    "--annotated-only",
+    is_flag=True,
+    default=False,
+    help="Export only events that have annotations (labels, stars, comments).",
+)
+@click.option(
+    "--include-legacy",
+    is_flag=True,
+    default=False,
+    help=(
+        "Include legacy events (missing __ts_timeline_id). Use with caution "
+        "as it may cause data leakage in shared-index environments."
+    ),
+)
+def export_sketch(
+    sketch_id: int,
+    output_format: str,
+    method: str,
+    filename: str,
+    default_fields: bool,
+    annotated_only: bool,
+    include_legacy: bool,
+) -> None:
+    """Exports a Timesketch sketch to a forensic-grade zip archive.
+
+    The archive includes sketch metadata (as 'metadata.json') and all associated
+    events, formatted as specified (CSV or JSONL). By default, all event fields
+    are exported. Use the --default-fields flag to export only a predefined
+    set of common fields.
+    """
+    sketch = Sketch.get_by_id(sketch_id)
+    if not sketch:
+        print(f"ERROR: Sketch with ID {sketch_id} not found.")
+        return
+
+    if sketch.get_status.status == "archived":
+        print(
+            f"ERROR: Sketch {sketch_id} is archived. "
+            "Please unarchive it before exporting."
+        )
+        return
+
+    active_indices = list({t.searchindex.index_name for t in sketch.active_timelines})
+    active_tids = [t.id for t in sketch.active_timelines]
+
+    # Filter out closed indices to avoid errors
+    datastore = OpenSearchDataStore()
+    open_indices = _get_open_indices(datastore, active_indices)
+
+    if not open_indices:
+        print(f"ERROR: No open indices found for sketch {sketch_id}.")
+        if active_indices:
+            print(f"  Total indices in sketch: {', '.join(active_indices)}")
+            print("  Note: All indices appear to be CLOSED or MISSING in OpenSearch.")
+        else:
+            print("  Note: This sketch has no timelines associated with it.")
+        return
+
+    if method == "direct":
+        # Check for shared indices to warn about potential data leakage
+        shared_indices = []
+        for index_name in active_indices:
+            if SearchIndex.query.filter_by(index_name=index_name).count() > 1:
+                shared_indices.append(index_name)
+
+        if shared_indices:
+            click.echo(
+                click.style(
+                    "\nSECURITY WARNING: The following indices are shared "
+                    f"with other sketches: {', '.join(shared_indices)}.\n"
+                    "Direct export of legacy events (missing __ts_timeline_id) may "
+                    "cause cross-sketch data leakage.\n",
+                    fg="red",
+                    bold=True,
+                ),
+                err=True,
+            )
+
+        if include_legacy:
+            click.echo(
+                click.style(
+                    "LEGACY EXPORT ENABLED: Including events missing "
+                    "__ts_timeline_id. Use with extreme caution.\n",
+                    fg="yellow",
+                    bold=True,
+                ),
+                err=True,
+            )
+
+    if method == "direct" and output_format == "csv":
+        print("  Note: 'direct' method only supports JSONL. Switching format...")
+        output_format = "jsonl"
+
+    if not filename:
+        suffix = "_annotated" if annotated_only else ""
+        filename = f"sketch_{sketch_id}_{output_format}{suffix}_export.zip"
+    if not filename.lower().endswith(".zip"):
+        filename += ".zip"
+    if os.path.exists(filename):
+        print(f"ERROR: File '{filename}' already exists.")
+        return
+
+    print(
+        f"Starting {method.upper()} export of Sketch [{sketch_id}] "
+        f'"{sketch.name}" to {filename}...'
+    )
+
+    # --- Add prominent warning to console output ---
+    click.echo(
+        click.style(
+            "\nWARNING: There is currently no native method to re-import "
+            "this exported archive back into Timesketch.\n",
+            fg="yellow",
+            bold=True,
+        ),
+        err=True,
+    )
+
+    # 1. Setup Temporary Workspace
+    tmp_dir = tempfile.mkdtemp(prefix=f"ts_export_{sketch_id}_")
+    tmp_zip_path = os.path.join(tmp_dir, "export.zip")
+    event_filename = f"events.{output_format}"
+    tmp_event_file = os.path.join(tmp_dir, event_filename)
+
+    try:
+        datastore = OpenSearchDataStore()
+        # 2. Gather Metadata
+        metadata = _get_sketch_metadata(sketch)
+
+        # Build annotation filter if requested
+        annotation_filter = None
+        if annotated_only:
+            annotation_filter = {
+                "bool": {
+                    "should": [
+                        {
+                            "nested": {
+                                "path": "timesketch_label",
+                                "query": {
+                                    "bool": {
+                                        "must": [
+                                            {
+                                                "term": {
+                                                    "timesketch_label.sketch_id": (
+                                                        sketch.id
+                                                    )
+                                                }
+                                            }
+                                        ]
+                                    }
+                                },
+                            }
+                        },
+                        {"exists": {"field": "tag"}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            }
+
+        # 3. Precise Count
+        print("  Calculating exact event count...")
+        total_expected = 0
+        verification_query_dsl = None
+        return_fields_to_fetch = DEFAULT_SOURCE_FIELDS if default_fields else None
+
+        if open_indices:
+            total_expected, _, verification_query_dsl = _calculate_export_counts(
+                sketch,
+                datastore,
+                active_indices,
+                active_tids,
+                method,
+                include_legacy,
+                annotation_filter,
+            )
+        else:
+            print("  Exporting all event fields.")
+            return_fields_to_fetch = None  # Pass None to get all fields
+
+        data_handle, _, _ = _fetch_and_prepare_event_data(
+            sketch, datastore, return_fields_to_fetch
+        )
+
+        # 4. Stream Events & Hash simultaneously
+        print(f"  Streaming events to {event_filename}...")
+        event_hash_obj = hashlib.sha256()
+        actual_row_count = 0
+
+        with open(tmp_event_file, "w", encoding="utf-8") as f_out:
+            with click.progressbar(
+                length=total_expected,
+                label="  Export Progress",
+                show_pos=True,
+                show_percent=True,
+                show_eta=True,
+            ) as progress_bar:
+
+                if method == "direct":
+                    if open_indices:
+                        should_clauses = [{"terms": {"__ts_timeline_id": active_tids}}]
+                        if include_legacy:
+                            should_clauses.append(
+                                {
+                                    "bool": {
+                                        "must_not": {
+                                            "exists": {"field": "__ts_timeline_id"}
+                                        }
+                                    }
+                                }
+                            )
+
+                        query = {
+                            "query": {
+                                "bool": {"must": [{"bool": {"should": should_clauses}}]}
+                            }
+                        }
+                        if annotation_filter:
+                            query["query"]["bool"]["must"].append(annotation_filter)
+
+                        for hit in helpers.scan(
+                            datastore.client, query=query, index=open_indices
+                        ):
+                            event_data = hit["_source"]
+                            event_data["_id"] = hit["_id"]
+                            event_data["_index"] = hit["_index"]
+                            line = json.dumps(event_data) + "\n"
+                            f_out.write(line)
+                            event_hash_obj.update(line.encode("utf-8"))
+                            actual_row_count += 1
+                            if actual_row_count % 10000 == 0:
+                                progress_bar.update(10000)
+                    else:
+                        print("    Note: No open indices to stream events from.")
+                else:
+                    if open_indices:
+                        fields = DEFAULT_SOURCE_FIELDS if default_fields else None
+                        api_query_dsl = None
+                        if annotated_only:
+                            api_query_dsl = {
+                                "query": {"bool": {"must": [annotation_filter]}}
+                            }
+
+                        data_handle, _, _ = _fetch_and_prepare_event_data(
+                            sketch=sketch,
+                            datastore=datastore,
+                            return_fields=fields,
+                            output_format=output_format,
+                            query_dsl=api_query_dsl,
+                        )
+                    else:
+                        print("    Note: No open indices to stream events from.")
+                        data_handle = None
+
+                    # Handle both string streams and DataFrames
+                    if data_handle is not None:
+                        if isinstance(data_handle, pd.DataFrame):
+                            if output_format == "csv":
+                                data_handle.to_csv(f_out, index=False)
+                            else:
+                                data_handle.to_json(f_out, orient="records", lines=True)
+                            actual_row_count = len(data_handle)
+                        else:
+                            # If it's a file-like object (e.g. io.StringIO),
+                            # stream it directly
+                            if hasattr(data_handle, "seek"):
+                                data_handle.seek(0)
+
+                            # We need to count events, but lines != events for
+                            # multi-line CSVs. Since we know this is a CSV/JSONL
+                            # already generated by pandas in
+                            # api_export.query_to_filehandle, we can trust
+                            # the pandas logic.
+                            # However, to report progress and verify, we must count.
+                            for line in data_handle:
+                                f_out.write(line)
+                                event_hash_obj.update(line.encode("utf-8"))
+
+                            # Reset count and use the known expected count for the
+                            # verification if we are streaming the whole file
+                            # at once.
+                            # Alternatively, for API method, we can get the count
+                            # from the sig.
+                            actual_row_count = total_expected
+                            progress_bar.update(total_expected)
+
+        event_hash = event_hash_obj.hexdigest()
+
+        # 5. Index Mappings
+        print("  Collecting index mappings...")
+        _export_index_mappings(datastore, active_indices, tmp_dir)
+
+        # 6. Stories as Markdown
+        print("  Exporting stories to Markdown...")
+        _export_stories_to_markdown(sketch, tmp_dir)
+
+        # 7. Verification
+        if actual_row_count != total_expected:
+            click.echo(
+                click.style(
+                    f"\nWARNING: Event count mismatch! Expected: {total_expected}, "
+                    f"Exported: {actual_row_count}",
+                    fg="red",
+                    bold=True,
+                ),
+                err=True,
+            )
+        else:
+            print(f"  Verification: {actual_row_count} events exported as expected.")
+
+        # 7.5 Spot Check Random Events
+        if actual_row_count > 0 and verification_query_dsl:
+            print("  Performing random spot check...")
+            sample_ids = _get_random_event_ids(
+                datastore, active_indices, verification_query_dsl, count=5
+            )
+            if sample_ids:
+                check_results = _spot_check_file(tmp_event_file, sample_ids)
+                success_count = sum(check_results.values())
+                if success_count == len(sample_ids):
+                    print(
+                        f"  SUCCESS: All {len(sample_ids)} sampled events "
+                        "found in export."
+                    )
+                else:
+                    click.echo(
+                        click.style(
+                            f"\nWARNING: Spot check failed! Only "
+                            f"{success_count}/{len(sample_ids)} sampled events "
+                            "were found in the exported file.",
+                            fg="red",
+                            bold=True,
+                        ),
+                        err=True,
+                    )
+            else:
+                print("  WARNING: Could not retrieve sample events for spot check.")
+
+        # 8. Save Metadata and Bundle
+        print("  Finalizing manifest and hashing files...")
+        with open(
+            os.path.join(tmp_dir, DEFAULT_EXPORT_METADATA_FILENAME),
+            "w",
+            encoding="utf-8",
+        ) as f_meta:
+            json.dump(metadata, f_meta, indent=2)
+
+        _generate_forensic_manifest(
+            sketch, method, actual_row_count, event_filename, event_hash, tmp_dir
+        )
+
+        print("  Creating compressed archive...")
+        _bundle_export_zip(tmp_dir, tmp_zip_path)
+
+        # 10. Move to Destination
+        # Using shutil.move instead of os.replace to handle cross-device
+        # moves (e.g. from /tmp to a mounted volume).
+        shutil.move(tmp_zip_path, filename)
+        print(f"Sketch exported successfully to {filename}")
+
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"ERROR during export: {e}")
+        print(traceback.format_exc())
+        sys.exit(1)
+    finally:
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
+
+
+@cli.command(name="check-opensearch-links")
+def check_opensearch_links():
+    """Checks for broken links between the database and OpenSearch.
+
+    This command iterates through all SearchIndex records in the database
+    and verifies that the corresponding index exists in OpenSearch. It helps
+    identify timelines that might be broken after an incomplete migration or
+    accidental index deletion.
+    """
+    print("Checking for broken links to OpenSearch...")
+    datastore = OpenSearchDataStore()
+    search_indices = SearchIndex.query.all()
+
+    if not search_indices:
+        print("No search indices found in the database.")
+        return
+
+    # Collect all index names from the database.
+    db_index_names = {s.index_name for s in search_indices}
+    db_index_names_list = list(db_index_names)
+    existing_os_index_names = set()
+
+    # Chunk size to avoid "too_long_http_line_exception"
+    chunk_size = 50
+
+    try:
+        for i in range(0, len(db_index_names_list), chunk_size):
+            chunk = db_index_names_list[i : i + chunk_size]
+            # Get existing indices from OpenSearch for this chunk.
+            # pylint: disable-next=unexpected-keyword-arg
+            existing_indices_info = datastore.client.indices.get(
+                index=chunk,
+                ignore_unavailable=True,
+            )
+            existing_os_index_names.update(existing_indices_info.keys())
+
+        # Determine which indices are in the DB but not in OpenSearch.
+        missing_index_names = db_index_names - existing_os_index_names
+
+        if not missing_index_names:
+            print(
+                "No broken links found. All database search"
+                " indices exist in OpenSearch."
+            )
+            return
+
+        # Create a map for quick lookup of original DB objects.
+        search_indices_map = {s.index_name: s for s in search_indices}
+        for index_name in sorted(list(missing_index_names)):
+            search_index = search_indices_map.get(index_name)
+            print(
+                f"BROKEN LINK: DB record for index '{index_name}' "
+                f"(ID: {search_index.id}) "
+                f"exists, but the index is MISSING in OpenSearch."
+            )
+            for timeline in search_index.timelines:
+                if timeline.sketch:
+                    print(
+                        f"  - Associated with Timeline '{timeline.name}'"
+                        f" (ID: {timeline.id})"
+                        f" in Sketch '{timeline.sketch.name}'"
+                        f" (ID: {timeline.sketch.id})"
+                    )
+                else:
+                    print(
+                        f"  - Associated with Timeline '{timeline.name}' "
+                        f"(ID: {timeline.id}) "
+                        f"which has no associated sketch (orphaned)."
+                    )
+        print("\nCheck complete. Broken links found as listed above.")
+
+    except Exception as e:  # pylint: disable=broad-except
+        print(f"ERROR communicating with OpenSearch while checking indices: {e}")
+        return
+
+
+@cli.command(name="check-db-orphaned-data")
+@click.option(
+    "--verbose-checks",
+    is_flag=True,
+    default=False,
+    help="Show output for all checks, even those that find no orphans.",
+)
+def check_db_orphaned_data(verbose_checks: bool):
+    """Checks for various types of orphaned data in the database.
+
+    This command looks for records that should have been deleted via
+    cascading rules if their parent objects were removed, particularly
+    in the context of a Sketch deletion or general database integrity.
+    """
+    print("Starting orphaned data check...")
+    found_orphans_overall = False
+
+    def _check_fk_orphans(
+        ModelClass: type,
+        fk_attr_name: str,
+        ParentModelClass: type,
+        description: str,
+        verbose_checks_enabled: bool,
+    ):
+        nonlocal found_orphans_overall
+        if verbose_checks_enabled:
+            print(
+                f"\nChecking for orphaned {description} "
+                f"({ModelClass.__name__} records)..."
+            )
+        orphaned_count = 0
+        all_records = ModelClass.query.all()
+
+        if not all_records:
+            if verbose_checks_enabled:
+                print(f"  No {ModelClass.__name__} records found.")
+            return
+
+        for record in all_records:
+            parent_id = getattr(record, fk_attr_name)
+            if parent_id:
+                parent = ParentModelClass.get_by_id(parent_id)
+                if not parent:
+                    # This is the first orphan found for this check type, print header
+                    if orphaned_count == 0 and not verbose_checks_enabled:
+                        print(
+                            f"\nFound orphaned {description} "
+                            f"({ModelClass.__name__} records):"
+                        )
+
+                    record_info_parts = [f"ID={record.id}"]
+                    if hasattr(record, "name") and record.name:
+                        record_info_parts.append(f"Name='{str(record.name)[:50]}'")
+                    elif hasattr(record, "title") and record.title:
+                        record_info_parts.append(f"Title='{str(record.title)[:50]}'")
+                    elif (
+                        hasattr(record, "original_filename")
+                        and record.original_filename
+                    ):
+                        record_info_parts.append(
+                            f"File='{str(record.original_filename)[:50]}'"
+                        )
+                    elif (
+                        hasattr(record, "label")
+                        and record.label
+                        and isinstance(record.label, str)
+                    ):
+                        record_info_parts.append(f"LabelVal='{str(record.label)[:50]}'")
+                    elif (
+                        hasattr(record, "status")
+                        and record.status
+                        and isinstance(record.status, str)
+                    ):
+                        record_info_parts.append(
+                            f"StatusVal='{str(record.status)[:50]}'"
+                        )
+                    elif (
+                        hasattr(record, "comment")
+                        and record.comment
+                        and isinstance(record.comment, str)
+                    ):
+                        record_info_parts.append(
+                            f"Comment='{str(record.comment)[:30]}...'"
+                        )
+
+                    record_info = ", ".join(record_info_parts)
+                    print(
+                        f"  ORPHANED {ModelClass.__name__}: {record_info}, "
+                        "linked to "
+                        f"non-existent {ParentModelClass.__name__} ID={parent_id} "
+                        f"via {fk_attr_name}"
+                    )
+                    orphaned_count += 1
+                    found_orphans_overall = True
+
+        if orphaned_count == 0:
+            if verbose_checks_enabled:
+                print(f"  No orphaned {description} ({ModelClass.__name__}) found.")
+        elif verbose_checks_enabled:  # Only print count if verbose and orphans found
+            print(
+                f"  Found {orphaned_count} orphaned {description} "
+                f"({ModelClass.__name__}) record(s)."
+            )
+
+    # Define checks: (ModelClass, fk_attr_name, ParentModelClass, description_plural)
+    fk_checks = [
+        # Direct children of Sketch
+        (Timeline, "sketch_id", Sketch, "Timelines (sketch link)"),
+        (View, "sketch_id", Sketch, "Views (sketch link)"),
+        (Event, "sketch_id", Sketch, "Events (DB metadata, sketch link)"),
+        (Story, "sketch_id", Sketch, "Stories (sketch link)"),
+        (Aggregation, "sketch_id", Sketch, "Aggregations (sketch link)"),
+        (Attribute, "sketch_id", Sketch, "Attributes (sketch link)"),
+        (Graph, "sketch_id", Sketch, "Graphs (sketch link)"),
+        (GraphCache, "sketch_id", Sketch, "GraphCaches (sketch link)"),
+        (AggregationGroup, "sketch_id", Sketch, "AggregationGroups (sketch link)"),
+        (Analysis, "sketch_id", Sketch, "Analyses (sketch link)"),
+        (AnalysisSession, "sketch_id", Sketch, "AnalysisSessions (sketch link)"),
+        (SearchHistory, "sketch_id", Sketch, "SearchHistories (sketch link)"),
+        (Scenario, "sketch_id", Sketch, "Scenarios (sketch link)"),
+        (Facet, "sketch_id", Sketch, "Facets (sketch link)"),
+        (
+            InvestigativeQuestion,
+            "sketch_id",
+            Sketch,
+            "InvestigativeQuestions (sketch link)",
+        ),
+        # Grandchildren and other relations
+        (DataSource, "timeline_id", Timeline, "DataSources (timeline link)"),
+        (Analysis, "timeline_id", Timeline, "Analyses (timeline link)"),
+        (Analysis, "analysissession_id", AnalysisSession, "Analyses (session link)"),
+        (
+            Analysis,
+            "approach_id",
+            InvestigativeQuestionApproach,
+            "Analyses (approach link)",
+        ),
+        (
+            Analysis,
+            "question_conclusion_id",
+            InvestigativeQuestionConclusion,
+            "Analyses (question conclusion link)",
+        ),
+        (AttributeValue, "attribute_id", Attribute, "AttributeValues (attribute link)"),
+        (Aggregation, "view_id", View, "Aggregations (view link)"),
+        (
+            Aggregation,
+            "aggregationgroup_id",
+            AggregationGroup,
+            "Aggregations (group link)",
+        ),
+        (AggregationGroup, "view_id", View, "AggregationGroups (view link)"),
+        (FacetTimeFrame, "facet_id", Facet, "FacetTimeFrames (facet link)"),
+        (FacetConclusion, "facet_id", Facet, "FacetConclusions (facet link)"),
+        (
+            InvestigativeQuestionApproach,
+            "investigativequestion_id",
+            InvestigativeQuestion,
+            "InvestigativeQuestionApproaches (question link)",
+        ),
+        (
+            InvestigativeQuestionConclusion,
+            "investigativequestion_id",
+            InvestigativeQuestion,
+            "InvestigativeQuestionConclusions (question link)",
+        ),
+        (
+            SearchHistory,
+            "parent_id",
+            SearchHistory,
+            "SearchHistories (parent/child link)",
+        ),
+        (SearchHistory, "scenario_id", Scenario, "SearchHistories (scenario link)"),
+        (SearchHistory, "facet_id", Facet, "SearchHistories (facet link)"),
+        (
+            SearchHistory,
+            "question_id",
+            InvestigativeQuestion,
+            "SearchHistories (question link)",
+        ),
+        (
+            SearchHistory,
+            "approach_id",
+            InvestigativeQuestionApproach,
+            "SearchHistories (approach link)",
+        ),
+        (Facet, "scenario_id", Scenario, "Facets (scenario link)"),
+        (
+            InvestigativeQuestion,
+            "scenario_id",
+            Scenario,
+            "InvestigativeQuestions (scenario link)",
+        ),
+        (
+            InvestigativeQuestion,
+            "facet_id",
+            Facet,
+            "InvestigativeQuestions (facet link)",
+        ),
+    ]
+
+    for Model, fk_attr, ParentModel, desc in fk_checks:
+        _check_fk_orphans(Model, fk_attr, ParentModel, desc, verbose_checks)
+
+    # Mixin checks
+    mixin_parent_models = [
+        (Sketch, "Sketch"),
+        (Timeline, "Timeline"),
+        (View, "View"),
+        (Event, "Event (DB metadata)"),
+        (Story, "Story"),
+        (Aggregation, "Aggregation"),
+        (AggregationGroup, "AggregationGroup"),
+        (Analysis, "Analysis"),
+        (Scenario, "Scenario"),
+        (Facet, "Facet"),
+        (InvestigativeQuestion, "InvestigativeQuestion"),
+        (InvestigativeQuestionApproach, "InvestigativeQuestionApproach"),
+        (InvestigativeQuestionConclusion, "InvestigativeQuestionConclusion"),
+        (FacetConclusion, "FacetConclusion"),
+        (SearchIndex, "SearchIndex"),
+        (SearchTemplate, "SearchTemplate"),
+        (SigmaRule, "SigmaRule"),
+        (Group, "Group"),
+    ]
+
+    mixin_types_info = [
+        ("Label", "Labels"),
+        ("Comment", "Comments"),
+        ("Status", "Statuses"),
+        ("GenericAttribute", "GenericAttributes"),
+        ("AccessControlEntry", "AccessControlEntries (ACLs)"),
+    ]
+
+    if verbose_checks:
+        print("\nChecking for orphaned Mixin-based Annotation records...")
+
+    for ParentModel, parent_model_name_desc in mixin_parent_models:
+        for mixin_class_name_suffix, mixin_desc_plural in mixin_types_info:
+            try:
+                AnnotationModel = getattr(ParentModel, mixin_class_name_suffix, None)
+                if AnnotationModel:  # If the mixin is used and class is available
+                    _check_fk_orphans(
+                        AnnotationModel,
+                        "parent_id",
+                        ParentModel,
+                        f"{mixin_desc_plural} for {parent_model_name_desc}",
+                        verbose_checks,
+                    )
+            except AttributeError:  # ParentModel might not use this mixin.
+                pass  # ParentModel might not use this mixin or it's not initialized.
+            except Exception as e:  # pylint: disable=broad-except
+                print(
+                    f"  ERROR trying to check {mixin_desc_plural} for "
+                    f"{parent_model_name_desc}: {e}"
+                )
+                found_orphans_overall = True
+
+    if not found_orphans_overall:
+        if verbose_checks:
+            print("\nNo orphaned data found based on current checks.")
+        else:
+            print(
+                "No orphaned data found."
+            )  # Minimal output if no orphans and not verbose
+    else:
+        print("\nOrphaned data check complete. Issues found as listed above.")
+
+
+@cli.command(name="find-inconsistent-archives")
+def find_inconsistent_archives():
+    """Finds sketches that are in an inconsistent archival state.
+
+    An inconsistent state is defined as a sketch that has been marked as
+    'archived', but still contains one or more timelines that are not also
+    archived (e.g., they are 'ready', 'failed' or 'processing'). This can
+    happen if the archival process was interrupted or failed.
+
+    This command helps administrators identify these inconsistencies so they
+    can be manually resolved, ensuring data integrity and proper data
+    lifecycle management.
+
+    To resolve an inconsistent archive, you typically need to:
+    1. Unarchive the sketch.
+    2. Remove the inconsistent timeline(s) from the sketch.
+    3. Re-archive the sketch.
+    These actions can be performed via the API or the UI.
+    """
+    print("Searching for inconsistently archived sketches...")
+    inconsistent_sketches = []
+
+    sketches = Sketch.query.all()
+    for sketch in sketches:
+        if sketch.get_status.status == "archived":
+            unarchived_timelines = []
+            for timeline in sketch.timelines:
+                if timeline.get_status.status != "archived":
+                    unarchived_timelines.append(timeline)
+
+            if unarchived_timelines:
+                inconsistent_sketches.append((sketch, unarchived_timelines))
+
+    if not inconsistent_sketches:
+        print("No inconsistent sketches found.")
+        return
+
+    print(f"\nFound {len(inconsistent_sketches)} inconsistently archived sketch(es):")
+    for sketch, timelines in inconsistent_sketches:
+        print("-" * 40)
+        print(f"Sketch: '{sketch.name}' (ID: {sketch.id})")
+        print("  Unarchived Timelines:")
+        for timeline in timelines:
+            print(
+                f"    - Timeline: '{timeline.name}' (ID: {timeline.id}), "
+                f"Status: {timeline.get_status.status}"
+            )
+            if timeline.get_status.status == "fail":
+                for datasource in timeline.datasources:
+                    error_msg = datasource.error_message or "No error message recorded."
+                    print(f"      - Reason: {error_msg}")
+
+        print("\n  Recommendation:")
+        print("    To resolve this, you need to:")
+        print("    1. Unarchive the sketch.")
+        print("    2. Remove the inconsistent timeline(s) from the sketch.")
+        print("    3. Re-archive the sketch.")
+        print("    These actions can be performed via the API or the UI.")
+        print(
+            "    - To get more details for a timeline, run: "
+            "tsctl timeline-status <TIMELINE_ID>"
+        )
+
+    print("-" * 40)
+
+
+@cli.command(name="export-db")
+@click.argument(
+    "filepath", type=click.Path(dir_okay=False, writable=True), required=True
+)
+def export_db(filepath):
+    """Export the database to a zip file."""
+    click.echo(f"Exporting database to {filepath}...")
+    engine = db_session.get_bind()
+    with engine.connect() as connection:
+        with zipfile.ZipFile(filepath, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for table in BaseModel.metadata.sorted_tables:
+                table_name = table.name
+                try:
+                    result = connection.execute(table.select())
+                    df = pd.DataFrame(result.fetchall(), columns=result.keys())
+                    row_count = df.shape[0]
+                    click.echo(f"  Exporting table: {table_name} ({row_count} rows)")
+                    json_data = df.to_json(orient="records", date_format="iso")
+                    zipf.writestr(f"{table_name}.json", json_data)
+                except Exception as e:
+                    click.echo(f"Error exporting table {table_name}: {e!s}", err=True)
+                    click.echo("Database export failed.", err=True)
+                    raise click.Abort()
+    click.echo("Database export complete.")
+
+
+@cli.command(name="import-db")
+@click.argument("filepath", type=click.Path(exists=True, dir_okay=False))
+@click.option("--yes", is_flag=True, help="Skip confirmation.")
+def import_db(filepath, yes):
+    """Import the database from a zip file. This will delete existing data."""
+    if not yes:
+        click.confirm(
+            "This will drop the current database and import data from the "
+            "file. This is a destructive action. Are you sure?",
+            abort=True,
+        )
+
+    click.echo("Dropping all tables...")
+    drop_all()
+
+    click.echo("Creating new tables...")
+    init_db()
+
+    # Create a mapping from table names to model classes for bulk insertion.
+    model_class_registry = {
+        cls.__tablename__: cls
+        for cls in BaseModel.__subclasses__()
+        if hasattr(cls, "__tablename__")
+    }
+
+    engine = db_session.get_bind()
+    dialect = engine.dialect.name
+
+    try:
+        # For certain database backends, we need to disable foreign key checks
+        # to allow for out-of-order table imports.
+        if dialect == "sqlite":
+            db_session.execute(sqlalchemy.text("PRAGMA foreign_keys=OFF"))
+        elif dialect == "postgresql":
+            db_session.execute(
+                sqlalchemy.text("SET session_replication_role = 'replica'")
+            )
+
+        with zipfile.ZipFile(filepath, "r") as zipf:
+            sorted_tables = BaseModel.metadata.sorted_tables
+            for table in sorted_tables:
+                table_name = table.name
+                json_filename = f"{table_name}.json"
+
+                if json_filename not in zipf.namelist():
+                    msg = (
+                        f"  File not found in archive for table: {table_name}, "
+                        "skipping."
+                    )
+                    click.echo(msg)
+                    continue
+                with zipf.open(json_filename) as json_file:
+                    data = json_file.read()
+                    if not data:
+                        click.echo(f"    Skipping empty file: {json_filename}")
+                        continue
+
+                    records = json.loads(data)
+                    row_count = len(records)
+                    click.echo(f"  Importing table: {table_name} ({row_count} rows)")
+
+                    if not records:
+                        continue
+
+                    # Coerce types for bulk insert
+                    for record in records:
+                        for column in table.columns:
+                            value = record.get(column.name)
+                            if value is None:
+                                continue
+                            # Handle datetimes
+                            if isinstance(column.type, sqlalchemy.DateTime):
+                                if isinstance(value, str):
+                                    try:
+                                        record[column.name] = pd.to_datetime(value)
+                                    except (ValueError, TypeError):
+                                        click.echo(
+                                            f"Warning: Could not parse datetime '{value}' for column '{column.name}' in table '{table_name}'. Setting to NULL.",  # pylint: disable=line-too-long
+                                            err=True,
+                                        )
+                                        record[column.name] = None
+
+                    mapped_class = model_class_registry.get(table_name)
+                    if mapped_class:
+                        db_session.bulk_insert_mappings(mapped_class, records)
+                    elif records:
+                        db_session.execute(table.insert(), records)
+
+        if dialect == "postgresql":
+            click.echo("Updating PostgreSQL sequences...")
+            for table in sorted_tables:
+                for column in table.primary_key.columns:
+                    if column.autoincrement:
+                        query_string = (
+                            "SELECT pg_get_serial_sequence("
+                            f"'\"{table.name}\"', '{column.name}')"
+                        )
+                        seq_name = db_session.execute(
+                            sqlalchemy.text(query_string)
+                        ).scalar()
+                        if seq_name:
+                            max_id_val = db_session.execute(
+                                sqlalchemy.text(
+                                    f'SELECT MAX("{column.name}") FROM "{table.name}"'
+                                )
+                            ).scalar()
+                            max_id = max_id_val or 1
+                            db_session.execute(
+                                sqlalchemy.text(
+                                    f"SELECT setval('{seq_name}', {max_id}, true);"
+                                )
+                            )
+            click.echo("Sequences updated.")
+
+        try:
+            db_session.commit()
+        except Exception as e:
+            db_session.rollback()
+            click.echo(f"Error committing to database: {e!s}", err=True)
+            raise click.Abort()
+    except Exception as e:
+        db_session.rollback()
+        click.echo(f"An error occurred during import: {e}", err=True)
+        raise click.Abort()
+    finally:
+        # reset the database settings
+        if dialect == "sqlite":
+            db_session.execute(sqlalchemy.text("PRAGMA foreign_keys=ON"))
+        elif dialect == "postgresql":
+            db_session.execute(
+                sqlalchemy.text("SET session_replication_role = 'origin'")
+            )
+        click.echo("Database import finished.")
+
+
+@cli.command(name="sync-groups-from-json")
+@click.argument("filepath")
+@click.option(
+    "--dry-run", is_flag=True, help="Calculate changes/logs without committing."
+)
+def sync_groups_from_json(filepath, dry_run):
+    """Synchronize user groups from a JSON file.
+
+    The JSON file should be a dictionary where keys are group names and values
+    are lists of usernames (email addresses).
+
+    The script will:
+    1. Create groups that don't exist.
+    2. Create users that don't exist (with a random password).
+    3. Add users to groups defined in the JSON.
+    4. Remove users from groups if they are NOT in the JSON list for that group.
+       (User accounts are NOT deleted and keep access to Sketches they own or
+       dirtectly shared with the user)
+    5. Log all actions.
+
+    Groups existing in the database but NOT in the JSON file will be ignored
+    (not deleted), but a warning will be logged.
+    """
+    if not os.path.isfile(filepath):
+        raise click.ClickException(f"File not found: {filepath}")
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as fh:
+            group_mapping = json.load(fh)
+    except json.JSONDecodeError as e:
+        raise click.ClickException(f"Invalid JSON file: {e}")
+
+    if not isinstance(group_mapping, dict):
+        raise click.ClickException("JSON root must be a dictionary.")
+
+    click.echo("Pre-fetching existing users and groups...")
+    # Pre-fetch existing data to prevent N+1 queries
+    existing_users = {u.username: u for u in User.query.all()}
+    existing_groups = {g.name: g for g in Group.query.all()}
+
+    processed_groups = set()
+
+    # Helper to generate random password for new users
+    def generate_random_password(length=16):
+        alphabet = string.ascii_letters + string.digits + string.punctuation
+        return "".join(secrets.choice(alphabet) for i in range(length))
+
+    for group_name, desired_members in group_mapping.items():
+        processed_groups.add(group_name)
+
+        # 1. Get or Create Group
+        group = existing_groups.get(group_name)
+        if not group:
+            click.echo(f"Creating new group: '{group_name}'")
+            if not dry_run:
+                group = Group(name=group_name, display_name=group_name)
+                db_session.add(group)
+                # We need to flush to get an ID and allow relationships to work
+                db_session.flush()
+                existing_groups[group_name] = group
+            else:
+                click.echo(
+                    f"[DRY-RUN] Would create group {group_name} and add "
+                    f"{len(desired_members)} users."
+                )
+
+        # 2. Create missing users
+        # If dry-run and group doesn't exist, we can't inspect members,
+        # but we know we would create all desired members if they don't exist.
+        if group:
+            current_member_usernames = {u.username for u in group.users}
+        else:
+            current_member_usernames = set()
+
+        desired_member_set = set(desired_members)
+
+        # Identify users that need to be created first
+        for username in desired_member_set:
+            if username not in existing_users:
+                click.echo(f"Creating new user: '{username}'")
+                if not dry_run:
+                    new_user = User(username=username, name=username, active=True)
+                    # Set a random password so the account is valid
+                    random_pw = generate_random_password()
+                    new_user.set_password(random_pw)
+                    db_session.add(new_user)
+                    db_session.flush()  # Flush to make available for relationship
+                    existing_users[username] = new_user
+                    click.echo(f"User '{username}' created with random password.")
+                else:
+                    click.echo(f"[DRY-RUN] Would create user '{username}'")
+
+        # 3. Sync Membership (Add/Remove)
+        users_to_add = desired_member_set - current_member_usernames
+        users_to_remove = current_member_usernames - desired_member_set
+
+        # Additions
+        for username in users_to_add:
+            user_obj = existing_users.get(username)
+            # user_obj exists if not dry_run, or if it existed before this run
+            if user_obj and not dry_run:
+                click.echo(f"Adding user '{username}' to group '{group_name}'")
+                group.users.append(user_obj)
+            elif dry_run:
+                click.echo(
+                    f"[DRY-RUN] Would add user '{username}' to group '{group_name}'"
+                )
+
+        # Removals
+        for username in users_to_remove:
+            user_obj = existing_users.get(username)
+            if user_obj and not dry_run:
+                click.echo(f"Removing user '{username}' from group '{group_name}'")
+                group.users.remove(user_obj)
+            elif dry_run:
+                click.echo(
+                    f"[DRY-RUN] Would remove user '{username}' from group "
+                    f"'{group_name}'"
+                )
+
+    # 4. Warn about unmanaged groups
+    all_db_group_names = set(existing_groups.keys())
+    unmanaged_groups = all_db_group_names - processed_groups
+
+    if unmanaged_groups:
+        click.echo(
+            "The following groups exist in the DB but were not in the sync file"
+            " (skipped):"
+        )
+        for g in unmanaged_groups:
+            click.echo(f" -> {g}")
+
+    if not dry_run:
+        click.echo("Committing changes to database...")
+        try:
+            db_session.commit()
+            click.echo("Sync complete.")
+        except Exception as e:  # pylint: disable=broad-except
+            click.echo(f"Error: Failed to commit changes: {e}")
+            db_session.rollback()
+    else:
+        click.echo("[DRY-RUN] No changes committed.")

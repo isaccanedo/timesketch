@@ -1,0 +1,179 @@
+# Copyright 2019 Google Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Timesketch API client library."""
+
+from __future__ import unicode_literals
+
+import json
+
+import bs4
+
+from . import definitions
+
+
+def _get_message(response):
+    """Return a formatted message string from the response text.
+
+    Args:
+        response (requests.Response): a response object from a HTTP
+            request.
+
+    Returns:
+        str: a string with the message field extracted from the
+            response.text.
+    """
+    if response is None:
+        return "n/a"
+    response_text_raw = getattr(response, "text", None)
+    if response_text_raw is None:
+        return "n/a"
+
+    soup = bs4.BeautifulSoup(response_text_raw, features="html.parser")
+    if soup.p:
+        return soup.p.string  # pytype: disable=attribute-error
+
+    if isinstance(response_text_raw, bytes):
+        response_text = response_text_raw.decode("utf-8")
+    else:
+        response_text = response_text_raw
+
+    try:
+        response_dict = json.loads(response_text)
+    except json.JSONDecodeError:
+        return response_text
+
+    if not isinstance(response_dict, dict):
+        return str(response_dict)
+
+    return response_dict.get("message", str(response_dict))
+
+
+def _get_reason(response):
+    """Return the reason from a response.
+
+    Args:
+        response (requests.Response): a response object from a HTTP
+            request.
+
+    Returns:
+        str: a string with the reason field extracted from the
+            response.reason.
+    """
+    if response is None:
+        return "n/a"
+    reason = getattr(response, "reason", "n/a")
+    if isinstance(reason, bytes):
+        return reason.decode("utf-8")
+
+    return reason
+
+
+def get_response_json(response, logger):
+    """Return the JSON object from a response, logging any errors.
+
+    Args:
+        response (requests.Response): a response object from a HTTP request.
+        logger (logging.Logger): a logger object that can be used to write log
+          messages.
+
+    Returns:
+        dict: a dict with the decoded JSON object within the HTTP
+            response object.
+
+    Raises:
+        RuntimeError: if the API returns an HTTP error.
+        ValueError: if the API response cannot be JSON decoded.
+        NotFoundError: if the API returns a 404 HTTP error.
+    """
+    status = response.status_code in definitions.HTTP_STATUS_CODE_20X
+    if not status:
+        if response.status_code == definitions.HTTP_STATUS_CODE_NOT_FOUND:
+            error_message(response, "Not Found", error=NotFoundError)
+
+        error_message(
+            response,
+            message=("Failed to get a valid response json from Timesketch API"),
+        )
+
+    try:
+        return response.json()
+    except json.JSONDecodeError as e:
+        response_text_snippet = response.text[:500]
+        logger.warning(
+            "Unable to JSON decode the Timesketch API response! "
+            "Response snippet: %s",
+            response_text_snippet,
+            exc_info=True,
+        )
+        raise ValueError("Unable to JSON decode the Timesketch API response.") from e
+
+
+def error_message(response, message=None, error=RuntimeError):
+    """Raise an error using error message extracted from response.
+
+    Args:
+        response (requests.Response): a response object from a HTTP request.
+        message (str): Optional message to prepend to the error string.
+        error (Exception): The exception class to raise. Defaults to RuntimeError.
+
+    Raises:
+        error: The exception specified by the error argument.
+    """
+    if not message:
+        message = "Unknown error"
+    text = _get_message(response)
+    request = getattr(response, "request", None)
+    url = getattr(response, "url", getattr(request, "url", "n/a") if request else "n/a")
+
+    raise error(
+        f"{message}, with error [{getattr(response, 'status_code', 'n/a')}] "
+        f"{_get_reason(response)} {text} ({url})"
+    )
+
+
+def check_return_status(response, logger):
+    """Check return status and return a boolean.
+
+    Args:
+        response (requests.Response): a response object from a HTTP
+            request.
+        logger (logging.Logger): a logger object that can be used to
+            write log messages.
+
+    Returns:
+        bool: a boolean indicating whether the return status was in
+            the 20X range of HTTP responses.
+    """
+    status = response.status_code in definitions.HTTP_STATUS_CODE_20X
+    if status:
+        return status
+
+    logger.warning(
+        "Failed response: [{0:d}] {1:s}".format(
+            response.status_code, _get_message(response)
+        )
+    )
+    return status
+
+
+class Error(Exception):
+    """Base error class."""
+
+
+class NotFoundError(Error):
+    """Raised when a resource is not found."""
+
+
+class UnableToRunAnalyzer(Error):
+    """Raised when unable to run an analyzer."""

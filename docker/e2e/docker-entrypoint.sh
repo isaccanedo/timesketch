@@ -1,0 +1,134 @@
+#!/bin/bash
+
+# Default Gunicorn settings
+export WSGI_WORKER_CLASS="${WSGI_WORKER_CLASS:-gthread}"
+export NUM_WSGI_THREADS="${NUM_WSGI_THREADS:-2}"
+
+# Run the container the default way
+if [ "$1" = 'timesketch' ]; then
+  echo '**** Debugging information for e2e tests ****'
+  echo '** VENV Python version:'
+  /opt/venv/bin/python3 --version
+  echo '**'
+  echo '** VENV pip3 freeze:'
+  /opt/venv/bin/pip3 freeze
+  echo '**'
+  echo '** Python path:'
+  which python3
+  echo '**'
+  echo '*** System Python'
+  echo '** Python version:'
+  /usr/bin/python3 --version
+  echo '**'
+  echo '** pip3 list:'
+  /usr/bin/pip3 list --break-system-packages 2>/dev/null || /usr/bin/pip3 list
+  echo '**'
+  echo '** dpkg list for python3:'
+  dpkg -l | grep python3
+  echo '**'
+  echo '** Python path:'
+  which /usr/bin/python3
+  echo '**'
+  echo '** PATH:'
+  echo $PATH
+  echo '**'
+  echo '** PYTHONPATH:'
+  echo $PYTHONPATH
+  echo '**** End of debugging information ****'
+
+
+  # Copy the mappings for plaso ingestion.
+  cp /usr/local/src/timesketch/data/plaso.mappings /etc/timesketch/
+  cp /usr/local/src/timesketch/data/generic.mappings /etc/timesketch/
+
+  # Set SECRET_KEY in /etc/timesketch/timesketch.conf if it isn't already set
+  if grep -q "SECRET_KEY = '<KEY_GOES_HERE>'" /etc/timesketch/timesketch.conf; then
+    OPENSSL_RAND=$( openssl rand -base64 32 )
+    # Using the pound sign as a delimiter to avoid problems with / being output from openssl
+    sed -i 's#SECRET_KEY = "<KEY_GOES_HERE>"#SECRET_KEY = "'$OPENSSL_RAND'"#' /etc/timesketch/timesketch.conf
+  fi
+
+  # Set up the Postgres connection
+  if [ $POSTGRES_PASSWORD ]; then echo "POSTGRES_PASSWORD usage is discouraged. Use Docker Secrets instead and set POSTGRES_PASSWORD_FILE to /run/secrets/secret-name"; fi
+  if [ $POSTGRES_PASSWORD_FILE ]; then POSTGRES_PASSWORD=$(cat $POSTGRES_PASSWORD_FILE); fi
+
+  if [ $POSTGRES_USER ] && [ $POSTGRES_PASSWORD ] && [ $POSTGRES_ADDRESS ] && [ $POSTGRES_PORT ]; then
+    sed -i 's#postgresql://<USERNAME>:<PASSWORD>@localhost#postgresql://'$POSTGRES_USER':'$POSTGRES_PASSWORD'@'$POSTGRES_ADDRESS':'$POSTGRES_PORT'#' /etc/timesketch/timesketch.conf
+    unset POSTGRES_PASSWORD
+  else
+    # Log an error since we need the above-listed environment variables
+    echo "Please pass values for the POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_ADDRESS, and POSTGRES_PORT environment variables"
+    exit 1
+  fi
+
+  # Set up the OpenSearch connection
+  if [ $OPENSEARCH_HOST ] && [ $OPENSEARCH_PORT ]; then
+    sed -i 's#OPENSEARCH_HOSTS = \[{"host": "opensearch", "port": 9200}\]#OPENSEARCH_HOSTS = [{"host": "'$OPENSEARCH_HOST'", "port": '$OPENSEARCH_PORT'}]#' /etc/timesketch/timesketch.conf
+  else
+    # Log an error since we need the above-listed environment variables
+    echo "Please pass values for the OPENSEARCH_HOST and OPENSEARCH_PORT environment variables"
+  fi
+
+  # Set up the Redis connection
+  if [ $REDIS_ADDRESS ] && [ $REDIS_PORT ]; then
+    sed -i 's#UPLOAD_ENABLED = False#UPLOAD_ENABLED = True#' /etc/timesketch/timesketch.conf
+    sed -i 's#^CELERY_BROKER_URL =.*#CELERY_BROKER_URL = "redis://'$REDIS_ADDRESS':'$REDIS_PORT'"#' /etc/timesketch/timesketch.conf
+    sed -i 's#^CELERY_RESULT_BACKEND =.*#CELERY_RESULT_BACKEND = "redis://'$REDIS_ADDRESS':'$REDIS_PORT'"#' /etc/timesketch/timesketch.conf
+  else
+    # Log an error since we need the above-listed environment variables
+    echo "Please pass values for the REDIS_ADDRESS and REDIS_PORT environment variables"
+  fi
+
+  # Set up web credentials
+  if [ -z ${TIMESKETCH_USER:+x} ]; then
+    TIMESKETCH_USER="admin"
+    echo "TIMESKETCH_USER set to default: ${TIMESKETCH_USER}";
+  fi
+
+  if [ $TIMESKETCH_PASSWORD_FILE ]; then TIMESKETCH_PASSWORD=$(cat $TIMESKETCH_PASSWORD_FILE); fi
+  if [ -z ${TIMESKETCH_PASSWORD:+x} ]; then
+    TIMESKETCH_PASSWORD="$(openssl rand -base64 32)"
+    echo "TIMESKETCH_PASSWORD set randomly to: ${TIMESKETCH_PASSWORD}";
+  fi
+
+  # Sleep to allow the other processes to start
+  sleep 5
+  tsctl create-user "$TIMESKETCH_USER" --password "$TIMESKETCH_PASSWORD"
+  unset TIMESKETCH_PASSWORD
+  # create second user
+  tsctl create-user "$TIMESKETCH_USER2" --password "$TIMESKETCH_PASSWORD2"
+  unset TIMESKETCH_PASSWORD2
+
+  # Make admin user for e2e tests
+  sleep 2
+  tsctl create-user admin --password admin
+  tsctl make-admin admin
+
+  cat <<EOF >> /etc/timesketch/data_finder.yaml
+test_data_finder:
+    description: Testing the data finder in the e2e test.
+    notes: Import the partial EVTX file for e2e tests.
+    query_string: data_type:"windows:evtx:record" AND event_identifier:7036
+EOF
+
+  # Run the Timesketch server (without SSL)
+  export TIMESKETCH_UI_MODE="ng"
+  cd /tmp
+  exec bash -c "celery -A timesketch.lib.tasks worker --uid nobody --loglevel info & \
+  gunicorn --reload -b 0.0.0.0:80 \
+  --access-logfile - --error-logfile - --log-level info \
+  --timeout 120 \
+  --worker-class $WSGI_WORKER_CLASS \
+  --threads $NUM_WSGI_THREADS \
+  --workers 2 \
+  --max-requests 100 --max-requests-jitter 10 \
+  --limit-request-line 8190 \
+  timesketch.wsgi:application"
+fi
+
+echo 'Debugging information for e2e tests'
+dpkg -s plaso-tools
+psort.py --version
+
+# Run a custom command on container start
+exec "$@"
